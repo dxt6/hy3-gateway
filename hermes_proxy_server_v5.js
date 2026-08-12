@@ -119,33 +119,33 @@ function anthropicToOpenAI(p){
   return out;
 }
 
-// ---------- 上下文保护（防止超大历史把上游挂死 + 控制 prefill 耗时） ----------
-const MAX_CTX_EST = 32000;   // 估算 token 上限（hy3 窗口保守值；32K 实测 prefill ~4s，96K 要 10s+）
-const MAX_MSG_KEEP = 60;     // 最多保留消息条数
+// ---------- 上下文保护（保守策略：默认 100% 保留，仅极端情况才动） ----------
+const HARD_CTX_EST = 250000;   // 极端安全阀：仅当估算 > 250K 才考虑删最旧轮次
+const SINGLE_TOOL_MAX = 32000; // 单条 tool_result 安全字符上限（远宽松于原 2000）
 function trimContext(payload){
   const msgs = payload.messages;
   if(!Array.isArray(msgs) || !msgs.length) return;
   const est = () => Math.ceil(JSON.stringify(msgs).length / 3);
-  if(est() <= MAX_CTX_EST) {
-    // 单条 tool 内容超长也压缩
-    compressBigToolResults(msgs);
-    return;
-  }
-  // 从头成对删除(删 user+assistant 对, 保持 tool_use/tool_result 配对)
-  let i = 0;
-  while(msgs.length > MAX_MSG_KEEP && est() > MAX_CTX_EST && i < msgs.length - 2){
-    msgs.splice(i, 2);
-  }
+  // 始终先做单条级压缩（只压超长 tool_result，不影响整体上下文）
   compressBigToolResults(msgs);
-  console.log('[hermes] context trimmed: '+msgs.length+' msgs, est '+est()+' tok');
+  // 极端安全阀：仅在远超窗口时，从头部成对删除最旧轮次，并打告警日志
+  if(est() > HARD_CTX_EST){
+    let i = 0, removed = 0;
+    while(msgs.length > 4 && est() > HARD_CTX_EST && i < msgs.length - 2){
+      msgs.splice(i, 2); removed += 2;
+    }
+    console.log('[hermes][WARN] context OVERSAFE-TRIM removed '+removed+' oldest msgs, now '+msgs.length+' msgs, est '+est()+' tok');
+  }
+  // 正常会话（≤ 250K）完全不改动 messages，上下文 100% 保留
 }
 function compressBigToolResults(msgs){
   for(const m of msgs){
     const c = m.content;
     if(Array.isArray(c)){
       for(const b of c){
-        if(b && b.type==='tool_result' && typeof b.content==='string' && b.content.length>2000){
-          b.content = b.content.slice(0,2000)+'\n...[truncated by gateway]';
+        if(b && b.type==='tool_result' && typeof b.content==='string' && b.content.length>SINGLE_TOOL_MAX){
+          // 只截断单条超长工具结果，避免上游单条溢出；其余上下文不动
+          b.content = b.content.slice(0, SINGLE_TOOL_MAX) + String.fromCharCode(10) + '...[gateway: tool_result truncated to '+SINGLE_TOOL_MAX+' chars]';
         }
       }
     }
@@ -363,7 +363,7 @@ async function handleResponses( res, authOk, bodyStr ){
       const streamObj = await callUpstream(chat, true);
       res.writeHead(200,{'Content-Type':'text/event-stream; charset=utf-8','Cache-Control':'no-cache','Connection':'keep-alive','Transfer-Encoding':'chunked','X-Accel-Buffering':'no'});
       const reader = streamObj.getReader(); const decoder = new TextDecoder('utf-8');
-      let buf='';
+      let buf=''; let text='';
       const push = (evt, data)=>{ res.write('event: '+evt+'\n'); res.write('data: '+JSON.stringify(data)+'\n\n'); };
       const rid = 'resp_'+Date.now();
       push('response.created', { id:rid, object:'response', status:'in_progress', model:reqModel, output:[] });
@@ -382,12 +382,18 @@ async function handleResponses( res, authOk, bodyStr ){
               if(d==='[DONE]') continue;
               let j; try{ j = JSON.parse(d); }catch(e){ continue; }
               const dc = j.choices && j.choices[0] && j.choices[0].delta;
-              if(dc && dc.content) push('response.output_text.delta', { delta: dc.content, item_id:'msg_'+Date.now(), content_index:0 });
+              if(dc && dc.content){ text += dc.content; push('response.output_text.delta', { delta: dc.content, item_id:'msg_'+rid, content_index:0 }); }
             }
           }
-          push('response.completed', { id:rid, object:'response', status:'completed', model:reqModel, output:[{type:'message',status:'completed',role:'assistant',content:[{type:'output_text',text:'',annotations:[]}]}], usage:null });
+          push('response.completed', { id:rid, object:'response', status:'completed', model:reqModel, output:[{type:'message',status:'completed',role:'assistant',content:[{type:'output_text',text: text, annotations:[]}]}], usage:null });
           res.end();
-        }catch(e){ if(!res.writableEnded) res.end(); }
+        }catch(e){
+          console.error('[responses][stream] FAIL err='+((e&&e.message)||String(e))+' model='+reqModel);
+          if(!res.writableEnded){
+            push('response.completed', { id:rid, object:'response', status:'completed', model:reqModel, output:[{type:'message',status:'completed',role:'assistant',content:[{type:'output_text',text: text, annotations:[]}]}], usage:null });
+            res.end();
+          }
+        }
       })();
     } else {
       const r = await callUpstream(chat, false);

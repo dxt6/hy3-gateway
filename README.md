@@ -118,6 +118,7 @@ Claude Code / Claude Desktop / 任意客户端
 | 08-13 06:56 | 同期另有 429 重试 | `retry 1..3/3 ... 429` 后 `POST /chat/completions -> 502 (8888ms)`：部署 restart 期间 origin 短暂下线 + 客户端重试放大，耗尽成长计划额度；07:00 后日志干净 |
 | 08-13 07:15 | 复核收尾 | 隧道 `/health`+`/responses`+`/v1/responses` 全 200（1.9-2.1s）；live = GitHub `dcb8cd3` 合并版（含 `0fb2ece` 保守 trimContext）；README 修正过时的「截断 32K」描述；`.gitignore` 补一次性排障脚本 |
 | 08-13 07:18 | **codex 仍 502（真因）** | 诊断日志抓到 `[responses] FAIL err=tools is required when tool_choice is set`。真因：codex 用 Responses API 的 `additional_tools` 带 `type:"custom"` 的 `exec` 工具并设 `tool_choice`，`responsesToChat` 把 `additional_tools` 整段丢弃→顶层 `tools` 空→上游 chat/completions 拒。修复：`additional_tools` 的 function 工具并入顶层 tools；custom 降级成 system 消息；**无可用 function 工具时删掉 tool_choice**。模拟 codex 请求实测 200 |
+| 08-13 07:25 | **流式断流 + trimContext 被回退（两处）** | (a) codex 多轮流式报 `stream closed before response.completed`：旧流式 `catch` 出错只 `res.end()` 不发 `response.completed`。修复：累积 delta 文本，catch 中改发 `response.completed`（带已累积文本）+ 打印 `[responses][stream] FAIL` 捕获真实上游错误。(b) 上一轮「还原基线」误用 `server.js.bak_responses_good`（含旧 `MAX_CTX_EST=32000` 静默截断），把线上 `HARD_CTX_EST=250000` 保守版**回退**了。已还原保守版。两者已部署并 `IDENTICAL_TO_LIVE` |
 
 ### 关键经验（踩坑结论）
 - **成长计划 = 必须走 SDK 原生调用**（modelRequest）或带 SDK UA；HTTP 直连/JWT key 直连 = 403。
