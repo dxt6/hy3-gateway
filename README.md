@@ -72,6 +72,8 @@ Claude Code / Claude Desktop / 任意客户端
 6. **429 重试 + 并发控制**：命中 429/rate/limit 指数退避重试 3 次（1s/2s/4s）；并发信号量默认 4，排队不报错。
 7. **count_tokens**：`/v1/messages/count_tokens` 返回估算值（Claude Code 依赖此端点）。
 8. **OpenAI Responses API**：`/responses` 与 `/v1/responses` 兼容 codex 等客户端——`responsesToChat` 把 `input` 转 chat 消息、`chatToResponses` 把上游结果转 Responses 形状、流式用 `callUpstream(chat,true)` 的 reader 包成 Responses SSE 事件；模型统一回落 hy3-preview。
+   - **codex 特殊点（踩坑已修）**：codex 不走顶层 `tools`，而是用 Responses API 的 `additional_tools` 字段带**内置工具**（`{"type":"additional_tools","role":"developer","tools":[{...}]}`），常见一个 `type:"custom"` 的 `exec`（V8 沙箱）。转换规则：`additional_tools` 里的 `function` 工具并入 chat 顶层 `tools`；`custom` 工具**无法在 hy3 上真执行**，降级成一条 system 消息让模型"知道"有它；`role:"developer"` 当 system 处理。`tool_choice` 守卫：**只要有 `tool_choice` 却没有可用 function 工具就删掉 `tool_choice`**，否则上游 chat/completions 报 `tools is required when tool_choice is set` → 502。
+   - 已知限制：codex 的 `exec` 自定义工具在 hy3-preview 下**不能真正调用执行**（上游只认 function 工具），网关目前让它以文本方式"感知"该能力；若 codex 强依赖 exec 结果，会降级为纯文本对话。
 
 ---
 
@@ -115,6 +117,7 @@ Claude Code / Claude Desktop / 任意客户端
 | 08-13 06:52 | codex 报 502（第二轮） | 日志显示 `POST /responses -> 502 (~340ms)`，**快速失败非限流**：当时 live 仍把 `gpt-5-codex`/`o4-mini` 原样透传上游被拒。`fix_model.py` 改为无条件回落 hy3-preview 后，两个模型名实测均 200 |
 | 08-13 06:56 | 同期另有 429 重试 | `retry 1..3/3 ... 429` 后 `POST /chat/completions -> 502 (8888ms)`：部署 restart 期间 origin 短暂下线 + 客户端重试放大，耗尽成长计划额度；07:00 后日志干净 |
 | 08-13 07:15 | 复核收尾 | 隧道 `/health`+`/responses`+`/v1/responses` 全 200（1.9-2.1s）；live = GitHub `dcb8cd3` 合并版（含 `0fb2ece` 保守 trimContext）；README 修正过时的「截断 32K」描述；`.gitignore` 补一次性排障脚本 |
+| 08-13 07:18 | **codex 仍 502（真因）** | 诊断日志抓到 `[responses] FAIL err=tools is required when tool_choice is set`。真因：codex 用 Responses API 的 `additional_tools` 带 `type:"custom"` 的 `exec` 工具并设 `tool_choice`，`responsesToChat` 把 `additional_tools` 整段丢弃→顶层 `tools` 空→上游 chat/completions 拒。修复：`additional_tools` 的 function 工具并入顶层 tools；custom 降级成 system 消息；**无可用 function 工具时删掉 tool_choice**。模拟 codex 请求实测 200 |
 
 ### 关键经验（踩坑结论）
 - **成长计划 = 必须走 SDK 原生调用**（modelRequest）或带 SDK UA；HTTP 直连/JWT key 直连 = 403。

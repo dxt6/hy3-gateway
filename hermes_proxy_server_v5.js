@@ -114,41 +114,38 @@ function anthropicToOpenAI(p){
   if(p.stream!==undefined) out.stream = p.stream;
   if(p.temperature!==undefined) out.temperature = p.temperature;
   if(p.top_p!==undefined) out.top_p = p.top_p;
-  // 上下文保护：默认【完全原样保留】历史（避免 Claude Code 上下文被静默丢弃）。
-  // 只在单条 tool_result 超出上游单条安全上限时才压缩那条，绝不删除消息轮次。
+  // 上下文保护: 估算 token 超限则从头部成对截断 + 压缩超大 tool_result
   trimContext(out);
   return out;
 }
 
-// ---------- 上下文保护（保守策略：优先保住上下文） ----------
-// 不再从头部删除历史轮次——Claude Code 自有完整会话管理，网关砍历史 = 模型"失忆"。
-// 仅当单条 tool_result 超过上游单条安全上限时截断该条；并提供极端安全阀。
-const HARD_CTX_EST = 250000;   // 极端安全阀：仅当估算 > 250K 才考虑删最旧轮次
-const SINGLE_TOOL_MAX = 32000; // 单条 tool_result 安全字符上限（远宽松于原 4000）
+// ---------- 上下文保护（防止超大历史把上游挂死 + 控制 prefill 耗时） ----------
+const MAX_CTX_EST = 32000;   // 估算 token 上限（hy3 窗口保守值；32K 实测 prefill ~4s，96K 要 10s+）
+const MAX_MSG_KEEP = 60;     // 最多保留消息条数
 function trimContext(payload){
   const msgs = payload.messages;
   if(!Array.isArray(msgs) || !msgs.length) return;
   const est = () => Math.ceil(JSON.stringify(msgs).length / 3);
-  // 始终先做单条级压缩（只压超长 tool_result，不影响整体上下文）
-  compressBigToolResults(msgs);
-  // 极端安全阀：仅在远超窗口时，从头部成对删除最旧轮次，并打告警日志
-  if(est() > HARD_CTX_EST){
-    let i = 0, removed = 0;
-    while(msgs.length > 4 && est() > HARD_CTX_EST && i < msgs.length - 2){
-      msgs.splice(i, 2); removed += 2;
-    }
-    console.log('[hermes][WARN] context OVERSAFE-TRIM removed '+removed+' oldest msgs, now '+msgs.length+' msgs, est '+est()+' tok');
+  if(est() <= MAX_CTX_EST) {
+    // 单条 tool 内容超长也压缩
+    compressBigToolResults(msgs);
+    return;
   }
-  // 正常会话（≤ 250K）完全不改动 messages，上下文 100% 保留
+  // 从头成对删除(删 user+assistant 对, 保持 tool_use/tool_result 配对)
+  let i = 0;
+  while(msgs.length > MAX_MSG_KEEP && est() > MAX_CTX_EST && i < msgs.length - 2){
+    msgs.splice(i, 2);
+  }
+  compressBigToolResults(msgs);
+  console.log('[hermes] context trimmed: '+msgs.length+' msgs, est '+est()+' tok');
 }
 function compressBigToolResults(msgs){
   for(const m of msgs){
     const c = m.content;
     if(Array.isArray(c)){
       for(const b of c){
-        if(b && b.type==='tool_result' && typeof b.content==='string' && b.content.length>SINGLE_TOOL_MAX){
-          // 只截断单条超长工具结果，避免上游单条溢出；其余上下文不动
-          b.content = b.content.slice(0, SINGLE_TOOL_MAX) + '\n...[gateway: tool_result truncated to '+SINGLE_TOOL_MAX+' chars]';
+        if(b && b.type==='tool_result' && typeof b.content==='string' && b.content.length>2000){
+          b.content = b.content.slice(0,2000)+'\n...[truncated by gateway]';
         }
       }
     }
@@ -182,11 +179,7 @@ function streamOpenAIToAnthropic(reader, decoder, res, reqModel){
   let buffer='', started=false, stopSent=false;
   const blocks = []; let nextIndex = 0;
   const toolByOpenAI = {};
-  function sse(ev, data){
-    if(stopSent || res.writableEnded) return;        // 已结束则不重复写（防 ERR_HTTP_HEADERS_SENT）
-    try { res.write('event: '+ev+'\ndata: '+JSON.stringify(data)+'\n\n'); }
-    catch(e) { /* 客户端断开，忽略 */ }
-  }
+  function sse(ev, data){ res.write('event: '+ev+'\ndata: '+JSON.stringify(data)+'\n\n'); }
   function textBlock(){
     let b = blocks.find(x=>x.type==='text');
     if(!b){ b = {index:nextIndex++, type:'text', opened:false, stopped:false}; blocks.push(b); }
@@ -202,11 +195,9 @@ function streamOpenAIToAnthropic(reader, decoder, res, reqModel){
   }
   function closeAll(){ for(const b of blocks){ if(b.opened && !b.stopped){ sse('content_block_stop',{type:'content_block_stop',index:b.index}); b.stopped=true; } } }
   function finish(fr){
-    if(stopSent || res.writableEnded) return;
     closeAll();
     sse('message_delta',{type:'message_delta',delta:{stop_reason:mapStop(fr),stop_sequence:null},usage:{output_tokens:0}});
     sse('message_stop',{type:'message_stop'});
-    stopSent = true;
   }
   function onLine(line){
     if(!line.startsWith('data:')) return;
@@ -247,8 +238,8 @@ function streamOpenAIToAnthropic(reader, decoder, res, reqModel){
       }
     }
     if(!stopSent){ stopSent=true; finish(); }
-    if(!res.writableEnded){ try{ res.end(); }catch(e){} }
-  })().catch(()=>{ if(!res.writableEnded){ try{ res.end(); }catch(e){} } });
+    res.end();
+  })();
 }
 
 // 兼容客户端以 HTTP 代理方式把整条 HTTP 请求塞进 body（请求体以 "POST http://... HTTP/1.1" 开头）
@@ -272,7 +263,9 @@ function responsesToChat( body ){
   if(b.max_output_tokens || b.max_tokens) out.max_tokens = parseInt(b.max_output_tokens || b.max_tokens, 10);
   if(b.temperature !== undefined) out.temperature = b.temperature;
   if(b.top_p !== undefined) out.top_p = b.top_p;
+  const normTool = (t)=>{ const f = t.function || t; return { type:'function', function:{ name:f.name||'', description:f.description||'', parameters:f.parameters||f.input_schema||{type:'object',properties:{}} } }; };
   const input = b.input;
+  const customTools = []; // additional_tools 里的 non-function 工具（如 codex 的 custom exec），网关/上游无法真执行，降级为系统消息
   const pushText = (role, text)=>{ if(text) out.messages.push({ role, content: text }); };
   const pushImgs = (role, imgs)=>{
     if(!imgs.length) return;
@@ -286,7 +279,15 @@ function responsesToChat( body ){
     for(const it of input){
       if(typeof it === 'string'){ pushText('user', it); continue; }
       if(!it || typeof it !== 'object') continue;
-      let role = (it.role==='system')?'system':((it.role==='assistant')?'assistant':'user');
+      // ---- Responses API 内置工具：additional_tools（developer role 的 custom/function 工具，codex 用）----
+      if(it.type==='additional_tools' && Array.isArray(it.tools)){
+        for(const t of it.tools){
+          if(t.type==='function' || t.function){ if(!out.tools) out.tools=[]; out.tools.push(normTool(t)); }
+          else { customTools.push({ name:t.name, description:t.description, parameters: t.parameters||t.input_schema }); }
+        }
+        continue;
+      }
+      let role = (it.role==='system'||it.role==='developer')?'system':((it.role==='assistant')?'assistant':'user');
       let content = it.content;
       if(it.type==='input_text' && it.text){ pushText(role, it.text); continue; }
       if(Array.isArray(content)){
@@ -299,17 +300,31 @@ function responsesToChat( body ){
       }
     }
   }
+  // 顶层 function 工具（标准 Responses API tools 字段）
   if(Array.isArray(b.tools)){
-    out.tools = b.tools.filter(t=>t&&t.type==='function').map(t=>({ type:'function', function:{ name: t.name||'', description: t.description||'', parameters: t.parameters||t.input_schema||{type:'object',properties:{}} } }));
+    if(!out.tools) out.tools=[];
+    for(const t of b.tools){ if(t&&(t.type==='function'||t.function)) out.tools.push(normTool(t)); }
   }
+  // 把所有 custom 工具降级成一条系统消息，让模型“知道”有这能力（hy3 不支持真执行）
+  if(customTools.length){
+    const desc = customTools.map(c=>'- '+(c.name||'?')+(c.description?': '+c.description:'')).join(String.fromCharCode(10));
+    out.messages.unshift({ role:'system', content:'[gateway] 客户端声明了以下 custom 工具（当前网关无法真实执行，请用自然语言说明意图即可）：'+String.fromCharCode(10)+desc });
+  }
+  // tool_choice 守卫：仅当确有可用 function 工具时才保留；否则上游 chat/completions 会报 “tools is required when tool_choice is set” -> 502
   if(b.tool_choice){
     const tc = b.tool_choice;
-    if(tc==='auto'||tc==='none') out.tool_choice = tc;
-    else if(tc.type==='function') out.tool_choice = { type:'function', function:{ name: tc.name } };
+    const hasTools = Array.isArray(out.tools) && out.tools.length>0;
+    if((tc==='auto'||tc==='none') && hasTools) out.tool_choice = tc;
+    else if(tc.type==='function'){ if(hasTools) out.tool_choice = { type:'function', function:{ name: tc.name } }; }
+    else if(tc==='required'){ if(hasTools) out.tool_choice = 'required'; else delete out.tool_choice; }
+    else if(hasTools) out.tool_choice = tc;
+    else delete out.tool_choice;
   }
   trimContext(out);
   return out;
 }
+
+
 
 function chatToResponses( j, reqModel ){
   const ch = j.choices && j.choices[0];
@@ -343,7 +358,6 @@ async function handleResponses( res, authOk, bodyStr ){
   catch(e){ res.writeHead(400,{'Content-Type':'application/json'}); return res.end(JSON.stringify({error:{message:'bad json'}})); }
   const chat = responsesToChat(payload);
   const reqModel = chat.model;
-  console.error('[responses] IN model='+(payload&&payload.model)+' stream='+(!!(payload&&payload.stream))+' nMsgs='+(chat.messages?chat.messages.length:0)+' input='+JSON.stringify(payload&&payload.input).slice(0,300));
   try{
     if(chat.stream){
       const streamObj = await callUpstream(chat, true);
@@ -381,7 +395,6 @@ async function handleResponses( res, authOk, bodyStr ){
       res.end(JSON.stringify(chatToResponses(r, reqModel)));
     }
   }catch(e){
-    console.error('[responses] FAIL err='+((e&&e.message)||String(e))+' body='+String(bodyStr).slice(0,400));
     if(!res.headersSent){ res.writeHead(502,{'Content-Type':'application/json'}); res.end(JSON.stringify({error:{message:(e&&e.message)||String(e)}})); }
     else if(!res.writableEnded) res.end();
   }
