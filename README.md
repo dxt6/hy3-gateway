@@ -50,7 +50,7 @@ Claude Code / Claude Desktop / 任意客户端
         ▼
 ┌──────────────────────── 网关 hermes_proxy (v5.3) ────────────────────────┐
 │ 鉴权(token) → 模型映射(→hy3-preview) → 协议转换(Anthropic↔OpenAI)        │
-│ 上下文保护(超32K token截断) → 429退避重试(3次) → 并发信号量(默认4)        │
+│ 上下文保护(默认全保留/250K安全阀) → 429退避重试(3次) → 并发信号量(默认4)  │
 │ 工具调用(tool_use↔tool_calls) / count_tokens / 流式SSE双向转换           │
 └──────────────┬───────────────────────────────────────────────────────────┘
                │ @cloudbase/node-sdk app.ai().modelRequest()（SDK 原生调用）
@@ -68,7 +68,7 @@ Claude Code / Claude Desktop / 任意客户端
 2. **模型映射**：`claude-haiku-4-5`、`gpt-4o`、`deepseek-chat` 等 30+ 常见名 → **hy3-preview**（实测最快，工具调用正常；hy3 也可用但慢 2.4x）。
 3. **双协议**：`/v1/messages`（Anthropic）与 `/v1/chat/completions`（OpenAI），流式/非流式全支持，SSE 事件序列完整（含 content_block_stop，Claude Code 校验严格）。
 4. **工具调用**：tools 定义、tool_use/tool_result 多轮回传、流式 input_json_delta 分片，全部双向转换。
-5. **上下文保护**：请求 >32K token（估算=字符/3）时，从头部成对删除消息至 60 条，单条 tool_result >2KB 截断——防止超大历史挂死上游（3MB 会话曾导致 1 分钟卡死）。
+5. **上下文保护（已改为保守策略，勿退回旧版）**：`trimContext` 默认**完全不动 messages，上下文 100% 保留**；仅两层防护——① 单条 `tool_result` 超 `SINGLE_TOOL_MAX=32000` 字符时截断该条；② 估算 token（字符/3）超 `HARD_CTX_EST=250000` 才从头部成对删除最旧轮次并打 `[hermes][WARN] context OVERSAFE-TRIM` 日志。旧版本曾静默截断到 32K 导致「模型忘记前文」，已废弃。
 6. **429 重试 + 并发控制**：命中 429/rate/limit 指数退避重试 3 次（1s/2s/4s）；并发信号量默认 4，排队不报错。
 7. **count_tokens**：`/v1/messages/count_tokens` 返回估算值（Claude Code 依赖此端点）。
 8. **OpenAI Responses API**：`/responses` 与 `/v1/responses` 兼容 codex 等客户端——`responsesToChat` 把 `input` 转 chat 消息、`chatToResponses` 把上游结果转 Responses 形状、流式用 `callUpstream(chat,true)` 的 reader 包成 Responses SSE 事件；模型统一回落 hy3-preview。
@@ -113,6 +113,7 @@ Claude Code / Claude Desktop / 任意客户端
 | 08-12 | 上传 GitHub | `dxt6/hy3-gateway`（公开），敏感文件已 .gitignore |
 | 08-13 | codex 502（缺 /responses） | 新增 OpenAI Responses API 兼容层（/responses + /v1/responses）：`responsesToChat/chatToResponses/handleResponses`；模型统一回落 hy3-preview；经隧道验证 200 |
 | 08-13 | 部署重启期间 502 风暴 | 多次 restart 使 origin 短暂下线 + codex/WorkBuddy 重试耗尽 CloudBase 429 配额；自 07:00 起日志干净，已恢复 |
+| 08-13 07:15 | 复核收尾 | 隧道 `/health`+`/responses`+`/v1/responses` 全 200（1.9-2.1s）；live = GitHub `dcb8cd3` 合并版（含 `0fb2ece` 保守 trimContext）；README 修正过时的「截断 32K」描述；`.gitignore` 补一次性排障脚本 |
 
 ### 关键经验（踩坑结论）
 - **成长计划 = 必须走 SDK 原生调用**（modelRequest）或带 SDK UA；HTTP 直连/JWT key 直连 = 403。
@@ -138,7 +139,8 @@ Claude Code / Claude Desktop / 任意客户端
 |---|---|---|
 | HTTP 200 空/畸形响应 | 上游错误被包装（旧版本 bug） | 已修复；先验模型名/配额 |
 | 429 EXCEED_TOKEN_QUOTA_LIMIT | 模型名不认 或 额度/限流 | 换标准模型名（映射表内）；稍等重试；充值资源点 |
-| 卡 1 分钟 | 上下文过大（prefill 慢） | `/compact` 或新开对话；网关已自动截断 32K |
+| 卡 1 分钟 | 上下文过大（prefill 随长度线性变慢） | `/compact` 或新开对话。注意：网关**不再**静默截断到 32K（会丢记忆），只在 >250K 时才动 |
+| 模型「忘记」前文 | 旧版网关静默截断上下文到 32K | 已修（`0fb2ece`）：默认全保留，确认 live 的 `HARD_CTX_EST=250000` |
 | 回复吐出来又消失 | SSE 序列不完整 | 已修复 v4.1；确认网关是 v5.3 |
 | 工具调用停 | 转换层缺 tools 支持 | 已修复 v4；确认网关是 v5.3 |
 | 401 | token 不匹配 | 检查客户端 API Key = CB_PROXY_AUTH 值 |

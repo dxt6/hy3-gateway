@@ -5,13 +5,28 @@ local_gateway/
 *.pem
 *.key
 
-# ===== 调试/一次性脚本（内含硬编码凭据） =====
+# ===== 调试/一次性脚本（可能含硬编码凭据，且无长期价值） =====
 diag*.js
+diag*.py
 probe*.js
 probe*.py
 test_sdk.js
 verify_sdk.js
 fake_gateway.py
+# Cloudflare 隧道 / API Token 排障期的一次性脚本
+check_*.py
+click_*.py
+nav_*.py
+debug_*.py
+find_tunnels.py
+tunnels*.py
+token_*.py
+create_token.py
+redo_token*.py
+select_perm*.py
+analyze_badreq*.py
+server_log_tmp.js
+test_out/
 
 # ===== 日志 / 缓存 / 依赖 =====
 *.log
