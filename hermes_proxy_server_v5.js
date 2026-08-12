@@ -358,6 +358,7 @@ async function handleResponses( res, authOk, bodyStr ){
   catch(e){ res.writeHead(400,{'Content-Type':'application/json'}); return res.end(JSON.stringify({error:{message:'bad json'}})); }
   const chat = responsesToChat(payload);
   const reqModel = chat.model;
+  console.log('[responses] IN model='+(payload&&payload.model)+' stream='+(!!(payload&&payload.stream))+' nMsgs='+(Array.isArray(payload&&payload.input)?payload.input.length:0));
   try{
     if(chat.stream){
       const streamObj = await callUpstream(chat, true);
@@ -366,8 +367,11 @@ async function handleResponses( res, authOk, bodyStr ){
       let buf=''; let text='';
       const push = (evt, data)=>{ res.write('event: '+evt+'\n'); res.write('data: '+JSON.stringify(data)+'\n\n'); };
       const rid = 'resp_'+Date.now();
+      const iid = 'msg_'+rid, pid = 'part_'+rid;
       push('response.created', { id:rid, object:'response', status:'in_progress', model:reqModel, output:[] });
       push('response.in_progress', { id:rid, object:'response', status:'in_progress', model:reqModel, output:[] });
+      push('response.output_item.added', { output_index:0, item:{ id:iid, type:'message', status:'in_progress', role:'assistant', content:[] } });
+      push('response.content_part.added', { item_id:iid, output_index:0, content_index:0, part:{ type:'output_text', text:'', annotations:[] } });
       (async()=>{
         try{
           while(true){
@@ -382,15 +386,21 @@ async function handleResponses( res, authOk, bodyStr ){
               if(d==='[DONE]') continue;
               let j; try{ j = JSON.parse(d); }catch(e){ continue; }
               const dc = j.choices && j.choices[0] && j.choices[0].delta;
-              if(dc && dc.content){ text += dc.content; push('response.output_text.delta', { delta: dc.content, item_id:'msg_'+rid, content_index:0 }); }
+              if(dc && dc.content){ text += dc.content; push('response.output_text.delta', { item_id:iid, output_index:0, content_index:0, delta: dc.content }); }
             }
           }
-          push('response.completed', { id:rid, object:'response', status:'completed', model:reqModel, output:[{type:'message',status:'completed',role:'assistant',content:[{type:'output_text',text: text, annotations:[]}]}], usage:null });
+          const outText = text || '';
+          push('response.content_part.done', { item_id:iid, output_index:0, content_index:0, part:{ type:'output_text', text: outText, annotations:[] } });
+          push('response.output_item.done', { output_index:0, item:{ id:iid, type:'message', status:'completed', role:'assistant', content:[{type:'output_text', text: outText, annotations:[]}] } });
+          push('response.completed', { id:rid, object:'response', status:'completed', model:reqModel, output:[{type:'message',status:'completed',role:'assistant',content:[{type:'output_text',text: outText, annotations:[]}]}], usage:null });
           res.end();
         }catch(e){
           console.error('[responses][stream] FAIL err='+((e&&e.message)||String(e))+' model='+reqModel);
           if(!res.writableEnded){
-            push('response.completed', { id:rid, object:'response', status:'completed', model:reqModel, output:[{type:'message',status:'completed',role:'assistant',content:[{type:'output_text',text: text, annotations:[]}]}], usage:null });
+            const outText = text || '';
+            push('response.content_part.done', { item_id:iid, output_index:0, content_index:0, part:{ type:'output_text', text: outText, annotations:[] } });
+            push('response.output_item.done', { output_index:0, item:{ id:iid, type:'message', status:'completed', role:'assistant', content:[{type:'output_text', text: outText, annotations:[]}] } });
+            push('response.completed', { id:rid, object:'response', status:'completed', model:reqModel, output:[{type:'message',status:'completed',role:'assistant',content:[{type:'output_text',text: outText, annotations:[]}]}], usage:null });
             res.end();
           }
         }
