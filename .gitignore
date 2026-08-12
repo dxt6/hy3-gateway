@@ -1,0 +1,27 @@
+# ===== 敏感凭据（绝不上传） =====
+apikey.txt
+proxy-keys.json
+local_gateway/
+*.pem
+*.key
+
+# ===== 调试/一次性脚本（内含硬编码凭据） =====
+diag*.js
+probe*.js
+probe*.py
+test_sdk.js
+verify_sdk.js
+fake_gateway.py
+
+# ===== 日志 / 缓存 / 依赖 =====
+*.log
+node_modules/
+__pycache__/
+*.pyc
+.workbuddy/
+cockpit-tools/
+cloudbase-ai/
+
+# ===== 系统 =====
+.DS_Store
+Thumbs.db

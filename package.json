@@ -1,0 +1,10 @@
+{
+  "dependencies": {
+    "@cloudbase/ai": "^3.7.1",
+    "@cloudbase/cli": "^3.7.2",
+    "@cloudbase/cloudbase-mcp": "^2.26.0",
+    "@cloudbase/node-sdk": "^3.18.3",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "wx-server-sdk": "^4.0.2"
+  }
+}
