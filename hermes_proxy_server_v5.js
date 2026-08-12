@@ -358,27 +358,45 @@ async function handleResponses( res, authOk, bodyStr ){
   catch(e){ res.writeHead(400,{'Content-Type':'application/json'}); return res.end(JSON.stringify({error:{message:'bad json'}})); }
   const chat = responsesToChat(payload);
   const reqModel = chat.model;
-  console.log('[responses] IN model='+(payload&&payload.model)+' stream='+(!!(payload&&payload.stream))+' nMsgs='+(Array.isArray(payload&&payload.input)?payload.input.length:0));
+  console.log('[responses] IN model='+(payload&&payload.model)+' stream='+(!!(payload&&payload.stream))+' nMsgs='+(Array.isArray(payload&&payload.input)?payload.input.length:0)+' body='+JSON.stringify(payload).slice(0,1500));
   try{
     if(chat.stream){
-      const streamObj = await callUpstream(chat, true);
+      // 立即发响应头 + 保活：上游 prefill 期间（codex 长上下文可达数十秒）客户端若一直收不到字节，会被 Cloudflare/客户端 idle 超时掐断 -> "stream closed before response.completed"
       res.writeHead(200,{'Content-Type':'text/event-stream; charset=utf-8','Cache-Control':'no-cache','Connection':'keep-alive','Transfer-Encoding':'chunked','X-Accel-Buffering':'no'});
-      const reader = streamObj.getReader(); const decoder = new TextDecoder('utf-8');
-      let buf=''; let text='';
+      const decoder = new TextDecoder('utf-8');
+      let buf=''; let text=''; let deltaCount=0;
       const push = (evt, data)=>{ res.write('event: '+evt+'\n'); res.write('data: '+JSON.stringify(data)+'\n\n'); };
       const rid = 'resp_'+Date.now();
       const iid = 'msg_'+rid, pid = 'part_'+rid;
+      // 心跳：从 prefill 期就开始保活，整个流生命周期内每 3s 一条 SSE 注释（客户端/CF 忽略注释但重置 idle 计时）；仅在流收尾时清除
+      let hbCleared = false;
+      const clearHb = ()=>{ if(!hbCleared){ hbCleared=true; try{ clearInterval(heartbeat); }catch(_){} } };
+      const heartbeat = setInterval(()=>{ try{ res.write(': ping\n\n'); }catch(_){} }, 3000);
+      res.write(': ping\n\n'); // 抢在 prefill 之前先发一字节，让连接立刻变活跃
+      // 先发标准开场事件，让客户端确认流已开始
       push('response.created', { id:rid, object:'response', status:'in_progress', model:reqModel, output:[] });
       push('response.in_progress', { id:rid, object:'response', status:'in_progress', model:reqModel, output:[] });
       push('response.output_item.added', { output_index:0, item:{ id:iid, type:'message', status:'in_progress', role:'assistant', content:[] } });
       push('response.content_part.added', { item_id:iid, output_index:0, content_index:0, part:{ type:'output_text', text:'', annotations:[] } });
+      let streamObj;
+      try{
+        streamObj = await callUpstream(chat, true);
+      }catch(eUp){
+        clearHb();
+        const em = (eUp&&eUp.message)||String(eUp);
+        console.error('[responses][upstream] FAIL before stream err='+em+' model='+reqModel);
+        push('response.completed', { id:rid, object:'response', status:'failed', model:reqModel, output:[], error:{ message: em } });
+        return res.end(()=>{ console.log('[responses] RES_ENDED model='+reqModel+' upstream-fail'); });
+      }
+      const reader = streamObj.getReader();
       (async()=>{
         try{
           while(true){
             const { done, value } = await reader.read();
             if(done) break;
-            buf += decoder.decode(value,{stream:true});
-            const parts = buf.split('\n'); buf = parts.pop();
+            if(value && value.length){
+              buf += decoder.decode(value,{stream:true});
+              const parts = buf.split('\n'); buf = parts.pop();
             for(const line of parts){
               const s = line.trim();
               if(!s.startsWith('data:')) continue;
@@ -386,22 +404,29 @@ async function handleResponses( res, authOk, bodyStr ){
               if(d==='[DONE]') continue;
               let j; try{ j = JSON.parse(d); }catch(e){ continue; }
               const dc = j.choices && j.choices[0] && j.choices[0].delta;
-              if(dc && dc.content){ text += dc.content; push('response.output_text.delta', { item_id:iid, output_index:0, content_index:0, delta: dc.content }); }
+              if(dc && dc.content){ text += dc.content; deltaCount++; push('response.output_text.delta', { item_id:iid, output_index:0, content_index:0, delta: dc.content }); }
+            }
             }
           }
+          clearHb();
           const outText = text || '';
+          console.log('[responses] STREAM_DONE model='+reqModel+' completed=1 deltas='+deltaCount+' textLen='+(text?text.length:0));
+          push('response.output_text.done', { item_id:iid, output_index:0, content_index:0, text: outText });
           push('response.content_part.done', { item_id:iid, output_index:0, content_index:0, part:{ type:'output_text', text: outText, annotations:[] } });
           push('response.output_item.done', { output_index:0, item:{ id:iid, type:'message', status:'completed', role:'assistant', content:[{type:'output_text', text: outText, annotations:[]}] } });
           push('response.completed', { id:rid, object:'response', status:'completed', model:reqModel, output:[{type:'message',status:'completed',role:'assistant',content:[{type:'output_text',text: outText, annotations:[]}]}], usage:null });
-          res.end();
+          res.end(()=>{ console.log('[responses] RES_ENDED model='+reqModel+' completed=1'); });
         }catch(e){
+          clearHb();
           console.error('[responses][stream] FAIL err='+((e&&e.message)||String(e))+' model='+reqModel);
           if(!res.writableEnded){
             const outText = text || '';
-            push('response.content_part.done', { item_id:iid, output_index:0, content_index:0, part:{ type:'output_text', text: outText, annotations:[] } });
+            console.log('[responses] STREAM_DONE model='+reqModel+' completed=0 deltas='+deltaCount+' err='+((e&&e.message)||String(e)));
+            push('response.output_text.done', { item_id:iid, output_index:0, content_index:0, text: outText });
+          push('response.content_part.done', { item_id:iid, output_index:0, content_index:0, part:{ type:'output_text', text: outText, annotations:[] } });
             push('response.output_item.done', { output_index:0, item:{ id:iid, type:'message', status:'completed', role:'assistant', content:[{type:'output_text', text: outText, annotations:[]}] } });
             push('response.completed', { id:rid, object:'response', status:'completed', model:reqModel, output:[{type:'message',status:'completed',role:'assistant',content:[{type:'output_text',text: outText, annotations:[]}]}], usage:null });
-            res.end();
+            res.end(()=>{ console.log('[responses] RES_ENDED model='+reqModel+' completed=0'); });
           }
         }
       })();
