@@ -112,7 +112,8 @@ Claude Code / Claude Desktop / 任意客户端
 | 08-12 14:55 | 整体卡顿 | 换 **hy3-preview**（快 2.4x）；v5.3 定版 |
 | 08-12 | 上传 GitHub | `dxt6/hy3-gateway`（公开），敏感文件已 .gitignore |
 | 08-13 | codex 502（缺 /responses） | 新增 OpenAI Responses API 兼容层（/responses + /v1/responses）：`responsesToChat/chatToResponses/handleResponses`；模型统一回落 hy3-preview；经隧道验证 200 |
-| 08-13 | 部署重启期间 502 风暴 | 多次 restart 使 origin 短暂下线 + codex/WorkBuddy 重试耗尽 CloudBase 429 配额；自 07:00 起日志干净，已恢复 |
+| 08-13 06:52 | codex 报 502（第二轮） | 日志显示 `POST /responses -> 502 (~340ms)`，**快速失败非限流**：当时 live 仍把 `gpt-5-codex`/`o4-mini` 原样透传上游被拒。`fix_model.py` 改为无条件回落 hy3-preview 后，两个模型名实测均 200 |
+| 08-13 06:56 | 同期另有 429 重试 | `retry 1..3/3 ... 429` 后 `POST /chat/completions -> 502 (8888ms)`：部署 restart 期间 origin 短暂下线 + 客户端重试放大，耗尽成长计划额度；07:00 后日志干净 |
 | 08-13 07:15 | 复核收尾 | 隧道 `/health`+`/responses`+`/v1/responses` 全 200（1.9-2.1s）；live = GitHub `dcb8cd3` 合并版（含 `0fb2ece` 保守 trimContext）；README 修正过时的「截断 32K」描述；`.gitignore` 补一次性排障脚本 |
 
 ### 关键经验（踩坑结论）
@@ -144,7 +145,10 @@ Claude Code / Claude Desktop / 任意客户端
 | 回复吐出来又消失 | SSE 序列不完整 | 已修复 v4.1；确认网关是 v5.3 |
 | 工具调用停 | 转换层缺 tools 支持 | 已修复 v4；确认网关是 v5.3 |
 | 401 | token 不匹配 | 检查客户端 API Key = CB_PROXY_AUTH 值 |
-| 502（上游 429 限流） | CloudBase 成长计划额度/并发耗尽，网关重试 3 次后仍失败；客户端（codex/WorkBuddy）频繁重试会放大成「重试风暴」打满额度 | 稍等额度恢复再试；避免 codex 与 WorkBuddy 同时高并发；必要时升级成长计划额度 |
+| 502 | **先看日志里的耗时，能直接区分根因**（`journalctl -u hermes-proxy \| grep 502`） | 见下两行 |
+| └ 502 耗时 <1s（如 340ms） | 上游**立即拒绝**：模型名不被 CloudBase 接受（未映射就透传）、请求体畸形 | 确认 `model: MODEL_MAP[b.model] \|\| 'hy3-preview'`（**不要**带 `\|\| b.model`，否则未登记名会透传被拒） |
+| └ 502 耗时 ~14s 且伴 `retry 1..3/3 ... 429` | CloudBase 成长计划额度/并发耗尽，退避重试 3 次仍失败；客户端频繁重试会放大成「重试风暴」 | 稍等额度恢复；避免 codex 与 WorkBuddy 同时高并发；必要时升级额度 |
+| 502 集中在一次部署前后 | `systemctl restart` 期间 origin 短暂下线，Cloudflare 隧道回 502 | 正常现象，重启完成即恢复；部署尽量少 restart |
 
 ---
 
