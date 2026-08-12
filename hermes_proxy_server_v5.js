@@ -343,6 +343,7 @@ async function handleResponses( res, authOk, bodyStr ){
   catch(e){ res.writeHead(400,{'Content-Type':'application/json'}); return res.end(JSON.stringify({error:{message:'bad json'}})); }
   const chat = responsesToChat(payload);
   const reqModel = chat.model;
+  console.error('[responses] IN model='+(payload&&payload.model)+' stream='+(!!(payload&&payload.stream))+' nMsgs='+(chat.messages?chat.messages.length:0)+' input='+JSON.stringify(payload&&payload.input).slice(0,300));
   try{
     if(chat.stream){
       const streamObj = await callUpstream(chat, true);
@@ -380,6 +381,7 @@ async function handleResponses( res, authOk, bodyStr ){
       res.end(JSON.stringify(chatToResponses(r, reqModel)));
     }
   }catch(e){
+    console.error('[responses] FAIL err='+((e&&e.message)||String(e))+' body='+String(bodyStr).slice(0,400));
     if(!res.headersSent){ res.writeHead(502,{'Content-Type':'application/json'}); res.end(JSON.stringify({error:{message:(e&&e.message)||String(e)}})); }
     else if(!res.writableEnded) res.end();
   }
