@@ -37,8 +37,10 @@ API Key:  <CB_PROXY_AUTH 的值>
 模型:     任意（统一回落 hy3-preview，含 o4-mini / gpt-5-codex 等未登记名）
 ```
 - 请求体 `input`（字符串或消息数组 / `input_text` 结构）自动转 chat 消息；`instructions` 作为 system 提示；`tools`(function)、`max_output_tokens`、`temperature`、`top_p`、`tool_choice` 透传。
-- 流式返回标准 Responses SSE 事件：`response.created → response.in_progress → response.output_text.delta → response.completed`。
+- 流式返回**完整标准 Responses SSE 事件序列（9 个）**：`response.created → response.in_progress → response.output_item.added → response.content_part.added → response.output_text.delta* → response.output_text.done → response.content_part.done → response.output_item.done → response.completed`。
+  - **协议要点（codex 严格客户端实测验证）**：每个事件的 `data` 必须带**顶层 `type` 字段**（与事件名一致，codex 按 `data.type` 分发）；`response.created / response.in_progress / response.completed` 三个事件的 payload 必须把整个 response 对象**嵌套在 `response` 字段**里（`{"type":"response.completed","response":{...}}`），不能平铺顶层——否则 codex 报 `stream closed before response.completed`。
 - 模型名不认时统一回落 `hy3-preview`（网关本质单后端 hy3-preview 代理），避免上游拒绝。
+- **codex 0.147 默认 WebSocket 优先**：会先 `wss://.../responses` 升级（网关不支持 WS → 502），重试 5 次后才回退 HTTPS，每次请求白等 ~15s。为免空等，codex 侧 `~/.codex/config.toml` 需用自定义 provider 且 `supports_websockets = false`：`base_url` 指向隧道、`wire_api="responses"`、`experimental_bearer_token` 用网关 token（CB_PROXY_AUTH 值）。
 
 ---
 
@@ -121,6 +123,7 @@ Claude Code / Claude Desktop / 任意客户端
 | 08-13 07:25 | **流式断流 + trimContext 被回退（两处）** | (a) codex 多轮流式报 `stream closed before response.completed`：旧流式 `catch` 出错只 `res.end()` 不发 `response.completed`。修复：累积 delta 文本，catch 中改发 `response.completed`（带已累积文本）+ 打印 `[responses][stream] FAIL` 捕获真实上游错误。(b) 上一轮「还原基线」误用 `server.js.bak_responses_good`（含旧 `MAX_CTX_EST=32000` 静默截断），把线上 `HARD_CTX_EST=250000` 保守版**回退**了。已还原保守版。两者已部署并 `IDENTICAL_TO_LIVE` |
 | 08-13 07:31 | **断流真因 = 流式事件序列不完整 + 诊断日志被误删** | 抓到 `[responses] IN ... nMsgs=19` 证明 codex 请求**能到达网关**（之前日志全空是因为"还原基线"用的是不含 `[responses] IN/FAIL` 的干净 bak，把诊断日志连带删了）。真因：网关只发 `created/in_progress/delta/completed`，缺 OpenAI Responses 规范必需的 `output_item.added` / `content_part.added` / `content_part.done` / `output_item.done`，codex 严格客户端收裸 delta 找不到 item 上下文即中断。修复：补全完整事件序列；恢复 `[responses] IN` 诊断日志（console.log 确保进 journald）。隧道流式实测事件序列完整 |
 | 08-13 07:45 | **codex 流式断流（最终根因 = prefill 期 idle 超时）** | 前面几轮把"事件序列不完整/上游错误"当根因都修了，仍报 `stream closed before response.completed`。实测定位：`handleResponses` 流式分支先 `await callUpstream(chat,true)`（上游 prefill，**codex 长上下文可达数十秒**）才 `res.writeHead`——prefill 期间客户端**收不到任何字节（无 HTTP 响应头）**，被 Cloudflare/客户端 idle 超时掐断。修复：把 `writeHead` + 即时 `: ping` + 心跳（每 3s 一条 SSE 注释）**整体提前到 `await callUpstream` 之前**，并让心跳常驻整条流（覆盖 prefill 与生成期任何停顿）；另补全规范事件 `response.output_text.done`。经隧道实测：headers 立即发出（response.created 由 3.2s 降到 ~0.9s），`: ping` 每 3s 穿透 Cloudflare 到达客户端，48s 长流完整收到 `response.completed` |
+| 08-13 07:56 | **codex 流式断流（真正最终根因 = 事件 payload 缺 type + response 包装；本机直接调 codex 复现）** | 前一轮修完 prefill 后 codex **仍**报 `stream closed before response.completed`。本机直接跑 codex 0.147 复现：①codex 传输层 **WebSocket 优先**，先 `wss://.../responses` 升级（网关不支持 WS）→ 502×6 → 回退 HTTPS；②回退后网关虽发完 `response.completed`（日志 `STREAM_DONE completed=1`/`RES_ENDED`），codex 却**按 `data.type` 分发事件**——我们所有事件缺顶层 `type` 字段，且 `created/in_progress/completed` 的 payload 未把 response 对象嵌套在 `response` 字段（真实 API 结构），codex 识别不了完成事件，nMsgs 逐次+1 反复重试。修复：`push` 助手自动注入 `type:<事件名>`；三个 response 级事件改为 `{response:{...}}` 嵌套。验证：本机 `codex exec` 经隧道正常返回（`正常` 与斐波那契代码），无断流；配合 `~/.codex/config.toml` 的 `supports_websockets=false` 自定义 provider，WS 502 重试也消失 |
 
 ### 关键经验（踩坑结论）
 - **成长计划 = 必须走 SDK 原生调用**（modelRequest）或带 SDK UA；HTTP 直连/JWT key 直连 = 403。
