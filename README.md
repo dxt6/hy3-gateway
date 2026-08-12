@@ -1,221 +1,154 @@
-# CloudBase AI 本地代理网关（hy3 · 小程序成长计划）
+# CloudBase hy3 LLM 网关（hy3-gateway）
 
-> 面向**其他 AI Agent / 开发者**：本文档说明如何把腾讯云开发「小程序成长计划」里的 10 个 API key 的 `hy3` 模型全部调通，并起一个本地代理端口、给每个本地 AI agent 分配独立 key 以实现并发隔离。
-
----
-
-## 0. 一句话结论
-
-两个 CloudBase 环境（网关一 / 网关二）都属于「小程序成长计划」，**用静态 API key 走 HTTP 网关直连会被 403 拒绝**（`AI_CHANNEL_NOT_ALLOWED`）。唯一干净的绕过方式：**用 `SecretId`/`SecretKey` 走 `@cloudbase/node-sdk` 在本地调用**——这条路径被服务端识别为「云开发 SDK 调用」（官方允许来源），直接扣成长计划免费额度，本地即可成功，无需部署云函数、无需付费升级套餐。
+> 让 Claude Code / Claude Desktop / 任意 OpenAI-或-Anthropic 兼容客户端，稳定调用腾讯云开发「小程序成长计划」赠送的 hy3 系列大模型（两个账号共 10 亿 token）。
+> 本 README 面向**接手的 AI Agent / 开发者**：读完即可了解现状、接入、运维与历史。
 
 ---
 
-## 1. 问题根因
+## 一、当前运行状态（接手必读）
 
-腾讯对「小程序成长计划」AI 资源包做了专项治理：
-
-- 成长计划免费额度**只允许从「允许来源」抵扣**：小程序 SDK、云函数/云托管内的云开发 SDK、云开发控制台。
-- 「AI 工具、Web SDK、第三方 API、直接 HTTP 调用」被列为**非允许来源**。
-- 非允许来源调用时，**不再从成长计划额度抵扣**；若环境没有可兜底的资源点套餐，则**直接失败（403）**。
-- 官方错误码页明文：*`AI_CHANNEL_NOT_ALLOWED` — 小程序成长计划仅支持小程序 SDK 和云开发 SDK 调用*。
-
-所以：10 个 key 在 `http://...api.tcloudbasegateway.com/v1/ai/cloudbase/v1/messages` 上全部 403，跟 key 本身无关，是「直连」这个调用方式被限。
-
-> ⚠️ 经验证：网关一/网关二**都是成长计划**，HTTP 直连一律 403；之前以为「网关一有付费套餐兜底」是误判。
-
----
-
-## 2. 绕过 403 的关键手段
-
-**本地用 `SecretId`/`SecretKey` 初始化 `@cloudbase/node-sdk`，而不是用静态 JWT key 走 HTTP 网关。**
-
-- 静态 JWT key + HTTP 网关 = 非允许来源 → 403。
-- `SecretId`/`SecretKey` + node-sdk = 云开发 SDK 调用 = 允许来源 → 成功扣免费额度。
-
-两个环境实测都返回正常结果（`pong`）。**本地运行即可，无需云函数。**
-
----
-
-## 3. 架构
-
-```
-本地多个 AI Agent（WorkBuddy 等）
-   │  各自持有一个「代理 key」(agent-01..10 或 local-gateway)
-   │  Authorization: Bearer <代理key>
-   ▼
-┌─────────────────────────────────────────────┐
-│  本地代理网关 relay.js  (127.0.0.1:58046)     │
-│   - 解析 apikey.txt → 10 真实 key + 凭据      │
-│   - 代理 key 1:1 映射到真实 key（并发隔离）   │
-│   - local-gateway → 最小负载选路（负载均衡）  │
-│   - 每真实 key 并发信号量(默认5) → 超限排队   │
-│   - 兼容 OpenAI /v1/chat/completions          │
-│          Anthropic /v1/messages  （含流式）   │
-└───────────────┬─────────────────────────────┘
-                │ @cloudbase/node-sdk (SecretId/SecretKey 签名)
-                ▼
-      腾讯云开发 AI 模型 hy3（扣成长计划免费额度）
-```
-
----
-
-## 4. 代理 key 设计（这就是并发隔离的核心）
-
-`apikey.txt` 里有 10 个真实 CloudBase key（网关一 5 个 + 网关二 5 个）。网关为每个真实 key 生成**一对一**的「代理 key」：
-
-| 代理 key | 映射到 | 并发上限 |
-|---|---|---|
-| `agent-01` … `agent-05` | 网关一 5 个 key | 各 5 |
-| `agent-06` … `agent-10` | 网关二 5 个 key | 各 5 |
-| `local-gateway` | 负载均衡总入口（按最小负载选路） | 合计 50 |
-
-- **给每个本地 AI agent 分配一个独立的 `agent-0X`**：该 agent 的所有流量只走它专属的真实 key，拥有独立的 5 并发额度，**与其他 agent 完全隔离**，互不抢占、互不触发限流。
-- **`local-gateway`**：不想逐个分配时，用这一个 key，网关自动把请求分散到当前最空闲的真实 key（负载均衡）。
-- 真实 key（JWT）**不暴露给 agent**，代理网关持有 `SecretId/SecretKey` 并统一走 node-sdk。
-
----
-
-## 5. 并发处理细节
-
-- 每个真实 key 维护一个**并发信号量**（默认 `MAX_CONCURRENCY=5`）。
-- 同一 key 的并发超过 5 时，**后续请求排队等待**，而不是返回 429/403——这正好解决「每个 key 只能 5 并发」的约束。
-- 命中成长计划速率限制（429）时，网关内部**指数退避重试**（最多 3 次）。
-- 多 agent 各用独立 key → 总并发能力 = 10 × 5 = 50。
-
-> 注意：成长计划是**免费额度**，仍有环境级速率上限。单 key 持续高频仍可能临时 429，网关会退避重试；合理安排 agent 数即可。
-
----
-
-## 6. 复现步骤（给另一个 AI Agent）
-
-### 6.1 准备
-- Node.js（本机用 managed 22.x）。
-- 安装 SDK（走本地隔离目录，不要污染全局）：
-  ```bash
-  export HTTP_PROXY=http://127.0.0.1:7897 HTTPS_PROXY=http://127.0.0.1:7897
-  npm install --prefix <隔离目录>/cloudbase-ai @cloudbase/node-sdk
-  ```
-- 准备 `apikey.txt`，格式（两个网关区块，每个含 base URL / SecretId / SecretKey / 若干 JWT key）：
-
-  ```
-  一：
-  https://dxt-d0gxfyz1h0c63958a.api.tcloudbasegateway.com/v1/ai/cloudbase
-
-  SecretId
-  <SecretId>
-
-  SecretKey
-  <SecretKey>
-
-  9：
-  <JWT key 9>
-  8：
-  <JWT key 8>
-  ...
-
-  二：
-  https://dxt667-d8g0fukkce12f8fcb.api.tcloudbasegateway.com/v1/ai/cloudbase
-
-  SecretId
-  <SecretId>
-
-  SecretKey
-  <SecretKey>
-
-  1：
-  <JWT key 1>
-  ...
-  ```
-
-### 6.2 启动代理网关
-```bash
-# start_relay.bat 等价于：
-set PORT=58046
-set MAX_CONCURRENCY=5
-set NODE_PATH=<隔离目录>/cloudbase-ai/node_modules
-node relay.js
-```
-启动后：
-- `GET http://127.0.0.1:58046/health` → 状态
-- `GET http://127.0.0.1:58046/keys` → 全部代理 key 清单（给 agent 分配用）
-- `GET http://127.0.0.1:58046/status` → 各 key 实时并发负载
-
-### 6.3 验证
-```bash
-node test_all_keys.js      # 10 个代理 key 双协议调通
-node test_concurrency.js   # 多 agent 并发 / 排队 / 负载均衡
-```
-
-### 6.4 在 AI Agent（如 WorkBuddy）里配置
-每个 agent 填：
-- **Base URL**：`http://127.0.0.1:58046`
-- **模型**：`hy3`
-- **API Key**：分配给它的代理 key（如 `agent-01`）；懒得分配就统一填 `local-gateway`
-
----
-
-## 7. 关键代码位置
-
-| 文件 | 作用 |
+| 项 | 值 |
 |---|---|
-| `relay.js` | 代理网关：解析凭据、代理 key 路由、负载均衡、并发信号量、OpenAI/Anthropic 协议、流式 |
-| `start_relay.bat` | 一键启动（设置 `PORT` / `MAX_CONCURRENCY` / `NODE_PATH`） |
-| `test_all_keys.js` | 10 代理 key 双协议全量验证 |
-| `test_concurrency.js` | 多 agent 并发 / 排队 / 负载均衡压力测试 |
-| `test_sdk.js` / `test_stream.js` | node-sdk 基础验证 / 流式验证 |
-| `proxy-keys.json` | 启动时生成的代理 key 清单 |
+| **推荐接入（生产·HTTPS 隧道）** | `https://hy3gateway.dxt116.dpdns.org`（Cloudflare Tunnel → 阿里云 8787，HTTPS，适合 WorkBuddy / codex 等走代理的客户端） |
+| 推荐接入（生产·公网直连） | `http://118.24.71.189:8787`（阿里云服务器，公网直连，本地零依赖） |
+| 备用接入 1 | 本地网关 `local_gateway/start_local_gateway.bat`（`http://127.0.0.1:8787`，仅依赖 CloudBase） |
+| 备用接入 2 | SSH 隧道 `start_tunnel_8787.bat`（本地 8787 → 阿里云 8787，公网端口被封时用） |
+| 网关版本 | **v5.3**（`hermes_proxy_server_v5.js`），模型映射目标 **hy3-preview** |
+| 上游环境 | 环境二 `dxt667-d8g0fukkce12f8fcb`（账号 2） |
+| 网关鉴权 Token | `CB_PROXY_AUTH`（在服务器 systemd 环境变量 / 本地启动脚本里，**不写进本 README**） |
+| AWS 服务器 (52.199.22.54) | **已弃用**，不再维护 |
+| 公网域名 (srv.dxt116.dpdns.org) | Cloudflare Tunnel → AWS，已弃用 |
+
+**实测性能（2026-08-12，阿里云直连）**：小请求流式 TTFB ~1.0-1.5s；工具调用 ~1.3s；32K 上下文 ~3.0s。
+
+### 客户端配置（Claude Code / Desktop 通用）
+```
+Base URL: http://118.24.71.189:8787   （本地网关则填 http://127.0.0.1:8787）
+API Key:  <CB_PROXY_AUTH 的值>
+模型:     任意（claude-haiku-4-5 / gpt-4o 等都会被映射到 hy3-preview）
+```
+鉴权兼容 4 种方式：`Authorization: Bearer`、裸 `Authorization`、`x-api-key`、`anthropic-api-key`。
+
+### codex / OpenAI Responses API 客户端
+网关额外实现了 OpenAI **Responses API** 端点 `/responses`（以及 `/v1/responses`），专供 codex 及任何走 Responses API 的客户端：
+```
+Base URL: https://hy3gateway.dxt116.dpdns.org        （或 http://118.24.71.189:8787）
+API Key:  <CB_PROXY_AUTH 的值>
+模型:     任意（统一回落 hy3-preview，含 o4-mini / gpt-5-codex 等未登记名）
+```
+- 请求体 `input`（字符串或消息数组 / `input_text` 结构）自动转 chat 消息；`instructions` 作为 system 提示；`tools`(function)、`max_output_tokens`、`temperature`、`top_p`、`tool_choice` 透传。
+- 流式返回标准 Responses SSE 事件：`response.created → response.in_progress → response.output_text.delta → response.completed`。
+- 模型名不认时统一回落 `hy3-preview`（网关本质单后端 hy3-preview 代理），避免上游拒绝。
 
 ---
 
-## 8. 注意事项
+## 二、架构
 
-1. **代理网关是本地后台进程**：电脑重启或会话结束后需重新运行 `start_relay.bat`。
-2. **真实 key 不出网关**：agent 只拿到代理 key，凭据由 `relay.js` 持有。
-3. **成长计划限流**：免费额度有环境级速率上限，高频会临时 429（网关已退避重试）。
-4. **不要在「非允许来源」用静态 JWT key 直连**：那才是 403 的根源；始终走 node-sdk 这条路径。
+```
+Claude Code / Claude Desktop / 任意客户端
+        │  Anthropic /v1/messages 或 OpenAI /v1/chat/completions（流式+非流式）
+        ▼
+┌──────────────────────── 网关 hermes_proxy (v5.3) ────────────────────────┐
+│ 鉴权(token) → 模型映射(→hy3-preview) → 协议转换(Anthropic↔OpenAI)        │
+│ 上下文保护(超32K token截断) → 429退避重试(3次) → 并发信号量(默认4)        │
+│ 工具调用(tool_use↔tool_calls) / count_tokens / 流式SSE双向转换           │
+└──────────────┬───────────────────────────────────────────────────────────┘
+               │ @cloudbase/node-sdk app.ai().modelRequest()（SDK 原生调用）
+               ▼
+        CloudBase AI 网关（hy3-preview，扣成长计划免费额度）
+```
+
+另一套独立功能：`relay.js`（本地多代理 key 中继，127.0.0.1:58046，给多个本地 agent 分配独立 key 做并发隔离，详见 §六）。
 
 ---
 
-## 9. 公网网关（服务器部署）排查经验（2026-08-12）
+## 三、核心机制（网关能力清单）
 
-### 9.1 架构
-```
-https://srv.dxt116.dpdns.org
-  → Cloudflare Tunnel (cloudflared-hermes.service, 隧道 ID 8f607cce-…)
-  → 127.0.0.1:8787 (hermes-proxy.service, node server.js, admin@52.199.22.54, Debian 13)
-  → CloudBase AI 网关（SecretId/SecretKey → node-sdk getClientCredential → Bearer token）
-```
-- 网关鉴权：`CB_PROXY_AUTH`（`<YOUR_GATEWAY_TOKEN>`），所有请求必须带 `Authorization: Bearer <CB_PROXY_AUTH>`。
-- systemd 服务：`hermes-proxy.service`（8787）、`cloudflared-hermes.service`（隧道）、`hy-agent.service`（8000 网页聊天 HY-Agent，与网关共享 CloudBase 额度）。
+1. **SDK 原生调用**（关键！）：上游用 `app.ai().modelRequest({url, data, stream, timeout})`（`@cloudbase/node-sdk`，`region: 'ap-shanghai'`，每次请求新建 `tcb.init`）。这是官方「云开发 SDK 调用」路径，成长计划才认——**不要改回自己拼 HTTP**（会被 403/限流）。
+2. **模型映射**：`claude-haiku-4-5`、`gpt-4o`、`deepseek-chat` 等 30+ 常见名 → **hy3-preview**（实测最快，工具调用正常；hy3 也可用但慢 2.4x）。
+3. **双协议**：`/v1/messages`（Anthropic）与 `/v1/chat/completions`（OpenAI），流式/非流式全支持，SSE 事件序列完整（含 content_block_stop，Claude Code 校验严格）。
+4. **工具调用**：tools 定义、tool_use/tool_result 多轮回传、流式 input_json_delta 分片，全部双向转换。
+5. **上下文保护**：请求 >32K token（估算=字符/3）时，从头部成对删除消息至 60 条，单条 tool_result >2KB 截断——防止超大历史挂死上游（3MB 会话曾导致 1 分钟卡死）。
+6. **429 重试 + 并发控制**：命中 429/rate/limit 指数退避重试 3 次（1s/2s/4s）；并发信号量默认 4，排队不报错。
+7. **count_tokens**：`/v1/messages/count_tokens` 返回估算值（Claude Code 依赖此端点）。
+8. **OpenAI Responses API**：`/responses` 与 `/v1/responses` 兼容 codex 等客户端——`responsesToChat` 把 `input` 转 chat 消息、`chatToResponses` 把上游结果转 Responses 形状、流式用 `callUpstream(chat,true)` 的 reader 包成 Responses SSE 事件；模型统一回落 hy3-preview。
 
-### 9.2 核心坑：成长计划靠 User-Agent 识别「SDK 调用」
-- **带 `User-Agent: tcb-node-sdk/3.18.3` → 200 正常扣免费额度；不带/默认 UA → 403 `AI_CHANNEL_NOT_ALLOWED`。**
-- hermes_proxy/server.js 自带该 UA，所以能过；测试脚本不带 UA 就 403（test_creds.js 就是这么失败的）。
-- 2026-08-12 现状：环境一 `dxt-d0gxfyz1h0c63958a` 配额耗尽（`EXCEED_TOKEN_QUOTA_LIMIT` 429）；**已切到环境二 `dxt667-d8g0fukkce12f8fcb`（同样带 UA 可用，额度未耗尽）**。切换改 hermes-proxy.service 的 CB_ENV_ID/CB_SID/CB_SKEY 后 `systemctl daemon-reload && restart` 即可，`server.js` 按 ENV_ID 自动拼上游地址。
+---
 
-### 9.3 修复过的代码 bug
-- `server.js` 原版不检查上游 statusCode，流式/非流式一律 `res.writeHead(200)` 透传 → 上游 429/403 被包装成「HTTP 200 + 错误 JSON/空 body」，客户端报 `empty or malformed response (HTTP 200)`。
-- 已修补（备份 `server.js.bak`）：上游非 2xx 时透传真实状态码 + `{"error":{"message":"upstream <msg>"}}`；流式分支同样先查 statusCode 再发 SSE。
+## 四、部署与运维
 
-### 9.4 用 SecretKey 申请新 API key（腾讯云 OpenAPI）
-- 接口：`POST https://tcb.tencentcloudapi.com`，`X-TC-Action: CreateApiKey`，`X-TC-Version: 2018-06-08`，TC3-HMAC-SHA256 签名。
-- 参数：`EnvId`、`KeyType: api_key|publish_key`、`KeyName`、`ExpireIn`（可选，不设=永不过期）；**必须带 `X-TC-Region`（ap-shanghai 可行）**。
-- 返回 JWT 明文（仅创建时返回，列表查询脱敏）。**每环境 api_key 上限 5 个**（`LimitExceeded apikey token limited 5`）——apikey.txt 已各 5 个，满额不能再建。
-- 本仓库 `create_apikey.py`：从 apikey.txt 读凭据，TC3 签名自动创建（含 Region 自动尝试）。
-- TC3 签名坑：Python `datetime.utcnow().timestamp()` 是 naive 时间按本地时区解释 → 时间戳偏 8 小时 → `AuthFailure.SignatureExpire`。用 `time.time()` 取真实 UTC。
+### 阿里云（生产）
+- 服务器：`118.24.71.189`（Debian 13, root, 2G 内存；SSH 已换密钥认证，本地 `~/.ssh/id_ed25519` 已授权）
+- 位置：`/opt/hermes_proxy/server.js`（即本仓库 `hermes_proxy_server_v5.js`）
+- systemd：`hermes-proxy.service`，Environment 含 `CB_ENV_ID/CB_SID/CB_SKEY/CB_PROXY_AUTH/LISTEN=0.0.0.0`，监听 `0.0.0.0:8787`（ufw 已放行）
+- 常用命令：`systemctl restart hermes-proxy`、`journalctl -u hermes-proxy -n 50`（查 429 重试/上下文截断日志）
 
-### 9.5 国内服务器部署（2026-08-12）
-- 服务器：**118.24.71.189**（阿里云 Debian 13, root, 2G 内存），网关 hermes-proxy 部署在 `/opt/hermes_proxy/server.js`（v4.2-cn-public），systemd 服务 `hermes-proxy.service`，环境二凭据（dxt667-…）。
-- **公网直连（本地零服务）**：服务监听 `0.0.0.0:8787`（ufw 已放行 8787，阿里云安全组已验证可通过），客户端 Base URL 直接填 **`http://118.24.71.189:8787`**，API Key 不变，无需 SSH 隧道/本地服务。
-- 延迟对比（本地实测直连）：health 0.15s、流式 TTFB ~1.13s、RTT 58ms；AWS 东京隧道 TTFB ~1.16s；公网 CF Tunnel TTFB 2.56s。
-- 安全说明：8787 公网暴露，靠 `CB_PROXY_AUTH`（Bearer/x-api-key 均可）鉴权保护，token 请勿泄露。
-- 备用接入：SSH 隧道 `start_tunnel_8787.bat`（本地 8787→服务器，公网端口被封时用）；旧 AWS（52.199.22.54）网关保留可回退。
-- 密码（备用）：root / <SERVER_PASSWORD>（已改用密钥认证）。
+### 本地网关（备用/零依赖）
+- 双击 `local_gateway/start_local_gateway.bat`（全英文注释，环境变量内嵌在 bat 中——**该文件含凭据，勿提交到公开仓库**）
 
-### 9.6 完全本地网关（不依赖任何远端服务器，2026-08-12）
-- 目录：`local_gateway/server.js`（v4.2 同款，监听 127.0.0.1:8787）+ `local_gateway/start_local_gateway.bat`（一键启动，全英文注释无乱码）。
-- 原理：本地 node 进程跑网关，用 apikey.txt 的环境二凭据**直连 CloudBase**（带 SDK UA），不需要 AWS/阿里云任何服务器。
-- 启动：双击 `local_gateway/start_local_gateway.bat`（保持窗口），客户端 Base URL 仍 `http://127.0.0.1:8787`。
-- 延迟（本地实测）：本地直连 CloudBase 流式 TTFB ~1.40s；对比：阿里云直连 1.13s、阿里云隧道 0.97s、AWS 隧道 1.16s、公网 CF 2.56s。
-- 三种接入方式：①本地网关（local_gateway，零依赖）②阿里云直连 `http://118.24.71.189:8787`（本地零服务）③SSH 隧道（start_tunnel_8787.bat，备用）。
-- bat 乱码说明：cmd 默认 GBK 解析 bat，UTF-8 中文注释会乱码；所有 bat 已改为纯英文。
+### 更新 / 回滚
+- 更新：改 `hermes_proxy_server_v5.js` → 上传到 `/opt/hermes_proxy/server.js` → `systemctl restart hermes-proxy`
+- 回滚：服务器 `/home/admin/hermes_proxy/` 或 `/opt/hermes_proxy/` 下保留了 `server.js.bak` ~ `bak6` 备份链
+- 本地 `local_gateway/server_v5.js` 与根目录 `hermes_proxy_server_v5.js` 需保持同步
+
+---
+
+## 五、历史工作记录（2026-08-11 ~ 08-12）
+
+| 时间 | 事件 | 关键点 |
+|---|---|---|
+| 08-11 | 本地 relay.js 网关加固 | 流式中断崩溃修复、并发 4、真流式 TTFB 1.2s |
+| 08-11 晚 | 公网网关报「HTTP 200 空响应」 | 根因：CloudBase 成长计划**靠 User-Agent `tcb-node-sdk/3.18.3` 识别 SDK 调用**；server.js 不检查上游状态码把错误包装成 200（已修） |
+| 08-12 00:10 | 环境一配额耗尽 | `EXCEED_TOKEN_QUOTA_LIMIT`；切环境二（带 UA 可用） |
+| 08-12 00:15 | Claude Code 探测 429 | 模型名不在白名单统一报配额错误；v3 加模型映射 + Anthropic 协议转换 |
+| 08-12 00:30 | 响应慢 | Cloudflare Tunnel 链路 2.56s；SSH 隧道方案 1.16s |
+| 08-12 00:50 | 回复吐出来又消失 | SSE 缺 content_block_stop（已补） |
+| 08-12 01:00 | 工具调用自己停 | 转换层丢 tools/tool_use/tool_result（v4 补齐） |
+| 08-12 01:05 | tool call 解析失败 | 流式块 index 不连续（v4.1 动态分配） |
+| 08-12 01:40 | webfetch 停 | count_tokens 端点被当聊天转发（v4.2 修复） |
+| 08-12 12:30 | 部署阿里云 | 公网直连 0.0.0.0:8787，本地零服务 |
+| 08-12 14:30 | 带上下文续对话卡死 | 会话 3.3MB / 95K token 挂死上游；v5.1 上下文保护（截断 96K→32K） |
+| 08-12 14:50 | 问"你是谁"要 1 分钟 | prefill 与上下文线性增长；v5.2 截断阈值降到 32K |
+| 08-12 14:55 | 整体卡顿 | 换 **hy3-preview**（快 2.4x）；v5.3 定版 |
+| 08-12 | 上传 GitHub | `dxt6/hy3-gateway`（公开），敏感文件已 .gitignore |
+| 08-13 | codex 502（缺 /responses） | 新增 OpenAI Responses API 兼容层（/responses + /v1/responses）：`responsesToChat/chatToResponses/handleResponses`；模型统一回落 hy3-preview；经隧道验证 200 |
+| 08-13 | 部署重启期间 502 风暴 | 多次 restart 使 origin 短暂下线 + codex/WorkBuddy 重试耗尽 CloudBase 429 配额；自 07:00 起日志干净，已恢复 |
+
+### 关键经验（踩坑结论）
+- **成长计划 = 必须走 SDK 原生调用**（modelRequest）或带 SDK UA；HTTP 直连/JWT key 直连 = 403。
+- **不认识的模型名统一报配额错误**（伪装成 EXCEED_TOKEN_QUOTA_LIMIT）——排查时先验模型名。
+- **hy3 prefill 随上下文线性变慢**：96K→10s，32K→3s。长会话是慢的根源，建议 `/compact` 或新开对话。
+- **Anthropic 流式协议很严格**：content_block_start/delta/stop 的 index 必须连续对应，缺一即解析失败。
+- **腾讯云 OpenAPI CreateApiKey**：每环境 api_key 上限 5 个（已满）；TC3 签名时间戳必须真实 UTC。
+
+---
+
+## 六、relay.js（本地多 key 中继，独立功能）
+
+- 用途：给多个本地 AI agent 分配独立代理 key（`agent-01..10` / `local-gateway`），1:1 映射真实 CloudBase key，并发隔离，总并发 10×4=40。
+- 启动：`start_relay.bat`（127.0.0.1:58046）；凭据从 `apikey.txt` 读取（**该文件含密钥，勿提交**）。
+- 接口：`/health`、`/keys`、`/status`。
+- 与 hermes_proxy 关系：两者独立；relay.js 面向多 agent 本地分发，hermes_proxy 面向单网关服务器部署。当前主力是 hermes_proxy。
+
+---
+
+## 七、已知问题与排查速查
+
+| 症状 | 原因 | 处理 |
+|---|---|---|
+| HTTP 200 空/畸形响应 | 上游错误被包装（旧版本 bug） | 已修复；先验模型名/配额 |
+| 429 EXCEED_TOKEN_QUOTA_LIMIT | 模型名不认 或 额度/限流 | 换标准模型名（映射表内）；稍等重试；充值资源点 |
+| 卡 1 分钟 | 上下文过大（prefill 慢） | `/compact` 或新开对话；网关已自动截断 32K |
+| 回复吐出来又消失 | SSE 序列不完整 | 已修复 v4.1；确认网关是 v5.3 |
+| 工具调用停 | 转换层缺 tools 支持 | 已修复 v4；确认网关是 v5.3 |
+| 401 | token 不匹配 | 检查客户端 API Key = CB_PROXY_AUTH 值 |
+| 502（上游 429 限流） | CloudBase 成长计划额度/并发耗尽，网关重试 3 次后仍失败；客户端（codex/WorkBuddy）频繁重试会放大成「重试风暴」打满额度 | 稍等额度恢复再试；避免 codex 与 WorkBuddy 同时高并发；必要时升级成长计划额度 |
+
+---
+
+## 八、安全注意事项（接手必须遵守）
+
+1. **凭据文件**（`apikey.txt`、`proxy-keys.json`、`local_gateway/start_local_gateway.bat`、服务器 systemd 里的 `CB_SID/CB_SKEY/CB_PROXY_AUTH`）**一律不进公开仓库**——`.gitignore` 已兜底，新增文件注意。
+2. 仓库 `dxt6/hy3-gateway` 是**公开**的，README/代码里不要写明文密钥；`hermes_proxy_server_v5.js` 从环境变量读凭据，安全。
+3. 阿里云 8787 公网暴露，靠 `CB_PROXY_AUTH` 鉴权；token 泄露 = CloudBase 额度被盗用，注意保管。
+4. GitHub 推送：走 HTTPS + 本地代理 7897；remote 不带 token（用 GCM 或一次性 token URL）。
