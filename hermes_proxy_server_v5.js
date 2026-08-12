@@ -113,38 +113,41 @@ function anthropicToOpenAI(p){
   if(p.stream!==undefined) out.stream = p.stream;
   if(p.temperature!==undefined) out.temperature = p.temperature;
   if(p.top_p!==undefined) out.top_p = p.top_p;
-  // 上下文保护: 估算 token 超限则从头部成对截断 + 压缩超大 tool_result
+  // 上下文保护：默认【完全原样保留】历史（避免 Claude Code 上下文被静默丢弃）。
+  // 只在单条 tool_result 超出上游单条安全上限时才压缩那条，绝不删除消息轮次。
   trimContext(out);
   return out;
 }
 
-// ---------- 上下文保护（防止超大历史把上游挂死） ----------
-const MAX_CTX_EST = 96000;   // 估算 token 上限（hy3 窗口保守值）
-const MAX_MSG_KEEP = 80;     // 最多保留消息条数
+// ---------- 上下文保护（保守策略：优先保住上下文） ----------
+// 不再从头部删除历史轮次——Claude Code 自有完整会话管理，网关砍历史 = 模型"失忆"。
+// 仅当单条 tool_result 超过上游单条安全上限时截断该条；并提供极端安全阀。
+const HARD_CTX_EST = 250000;   // 极端安全阀：仅当估算 > 250K 才考虑删最旧轮次
+const SINGLE_TOOL_MAX = 32000; // 单条 tool_result 安全字符上限（远宽松于原 4000）
 function trimContext(payload){
   const msgs = payload.messages;
   if(!Array.isArray(msgs) || !msgs.length) return;
   const est = () => Math.ceil(JSON.stringify(msgs).length / 3);
-  if(est() <= MAX_CTX_EST) {
-    // 单条 tool 内容超长也压缩
-    compressBigToolResults(msgs);
-    return;
-  }
-  // 从头成对删除(删 user+assistant 对, 保持 tool_use/tool_result 配对)
-  let i = 0;
-  while(msgs.length > MAX_MSG_KEEP && est() > MAX_CTX_EST && i < msgs.length - 2){
-    msgs.splice(i, 2);
-  }
+  // 始终先做单条级压缩（只压超长 tool_result，不影响整体上下文）
   compressBigToolResults(msgs);
-  console.log('[hermes] context trimmed: '+msgs.length+' msgs, est '+est()+' tok');
+  // 极端安全阀：仅在远超窗口时，从头部成对删除最旧轮次，并打告警日志
+  if(est() > HARD_CTX_EST){
+    let i = 0, removed = 0;
+    while(msgs.length > 4 && est() > HARD_CTX_EST && i < msgs.length - 2){
+      msgs.splice(i, 2); removed += 2;
+    }
+    console.log('[hermes][WARN] context OVERSAFE-TRIM removed '+removed+' oldest msgs, now '+msgs.length+' msgs, est '+est()+' tok');
+  }
+  // 正常会话（≤ 250K）完全不改动 messages，上下文 100% 保留
 }
 function compressBigToolResults(msgs){
   for(const m of msgs){
     const c = m.content;
     if(Array.isArray(c)){
       for(const b of c){
-        if(b && b.type==='tool_result' && typeof b.content==='string' && b.content.length>4000){
-          b.content = b.content.slice(0,4000)+'\n...[truncated by gateway]';
+        if(b && b.type==='tool_result' && typeof b.content==='string' && b.content.length>SINGLE_TOOL_MAX){
+          // 只截断单条超长工具结果，避免上游单条溢出；其余上下文不动
+          b.content = b.content.slice(0, SINGLE_TOOL_MAX) + '\n...[gateway: tool_result truncated to '+SINGLE_TOOL_MAX+' chars]';
         }
       }
     }
@@ -178,7 +181,11 @@ function streamOpenAIToAnthropic(reader, decoder, res, reqModel){
   let buffer='', started=false, stopSent=false;
   const blocks = []; let nextIndex = 0;
   const toolByOpenAI = {};
-  function sse(ev, data){ res.write('event: '+ev+'\ndata: '+JSON.stringify(data)+'\n\n'); }
+  function sse(ev, data){
+    if(stopSent || res.writableEnded) return;        // 已结束则不重复写（防 ERR_HTTP_HEADERS_SENT）
+    try { res.write('event: '+ev+'\ndata: '+JSON.stringify(data)+'\n\n'); }
+    catch(e) { /* 客户端断开，忽略 */ }
+  }
   function textBlock(){
     let b = blocks.find(x=>x.type==='text');
     if(!b){ b = {index:nextIndex++, type:'text', opened:false, stopped:false}; blocks.push(b); }
@@ -194,9 +201,11 @@ function streamOpenAIToAnthropic(reader, decoder, res, reqModel){
   }
   function closeAll(){ for(const b of blocks){ if(b.opened && !b.stopped){ sse('content_block_stop',{type:'content_block_stop',index:b.index}); b.stopped=true; } } }
   function finish(fr){
+    if(stopSent || res.writableEnded) return;
     closeAll();
     sse('message_delta',{type:'message_delta',delta:{stop_reason:mapStop(fr),stop_sequence:null},usage:{output_tokens:0}});
     sse('message_stop',{type:'message_stop'});
+    stopSent = true;
   }
   function onLine(line){
     if(!line.startsWith('data:')) return;
@@ -237,8 +246,8 @@ function streamOpenAIToAnthropic(reader, decoder, res, reqModel){
       }
     }
     if(!stopSent){ stopSent=true; finish(); }
-    res.end();
-  })();
+    if(!res.writableEnded){ try{ res.end(); }catch(e){} }
+  })().catch(()=>{ if(!res.writableEnded){ try{ res.end(); }catch(e){} } });
 }
 
 function handle(req,res){
