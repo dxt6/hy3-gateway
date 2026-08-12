@@ -120,6 +120,7 @@ Claude Code / Claude Desktop / 任意客户端
 | 08-13 07:18 | **codex 仍 502（真因）** | 诊断日志抓到 `[responses] FAIL err=tools is required when tool_choice is set`。真因：codex 用 Responses API 的 `additional_tools` 带 `type:"custom"` 的 `exec` 工具并设 `tool_choice`，`responsesToChat` 把 `additional_tools` 整段丢弃→顶层 `tools` 空→上游 chat/completions 拒。修复：`additional_tools` 的 function 工具并入顶层 tools；custom 降级成 system 消息；**无可用 function 工具时删掉 tool_choice**。模拟 codex 请求实测 200 |
 | 08-13 07:25 | **流式断流 + trimContext 被回退（两处）** | (a) codex 多轮流式报 `stream closed before response.completed`：旧流式 `catch` 出错只 `res.end()` 不发 `response.completed`。修复：累积 delta 文本，catch 中改发 `response.completed`（带已累积文本）+ 打印 `[responses][stream] FAIL` 捕获真实上游错误。(b) 上一轮「还原基线」误用 `server.js.bak_responses_good`（含旧 `MAX_CTX_EST=32000` 静默截断），把线上 `HARD_CTX_EST=250000` 保守版**回退**了。已还原保守版。两者已部署并 `IDENTICAL_TO_LIVE` |
 | 08-13 07:31 | **断流真因 = 流式事件序列不完整 + 诊断日志被误删** | 抓到 `[responses] IN ... nMsgs=19` 证明 codex 请求**能到达网关**（之前日志全空是因为"还原基线"用的是不含 `[responses] IN/FAIL` 的干净 bak，把诊断日志连带删了）。真因：网关只发 `created/in_progress/delta/completed`，缺 OpenAI Responses 规范必需的 `output_item.added` / `content_part.added` / `content_part.done` / `output_item.done`，codex 严格客户端收裸 delta 找不到 item 上下文即中断。修复：补全完整事件序列；恢复 `[responses] IN` 诊断日志（console.log 确保进 journald）。隧道流式实测事件序列完整 |
+| 08-13 07:45 | **codex 流式断流（最终根因 = prefill 期 idle 超时）** | 前面几轮把"事件序列不完整/上游错误"当根因都修了，仍报 `stream closed before response.completed`。实测定位：`handleResponses` 流式分支先 `await callUpstream(chat,true)`（上游 prefill，**codex 长上下文可达数十秒**）才 `res.writeHead`——prefill 期间客户端**收不到任何字节（无 HTTP 响应头）**，被 Cloudflare/客户端 idle 超时掐断。修复：把 `writeHead` + 即时 `: ping` + 心跳（每 3s 一条 SSE 注释）**整体提前到 `await callUpstream` 之前**，并让心跳常驻整条流（覆盖 prefill 与生成期任何停顿）；另补全规范事件 `response.output_text.done`。经隧道实测：headers 立即发出（response.created 由 3.2s 降到 ~0.9s），`: ping` 每 3s 穿透 Cloudflare 到达客户端，48s 长流完整收到 `response.completed` |
 
 ### 关键经验（踩坑结论）
 - **成长计划 = 必须走 SDK 原生调用**（modelRequest）或带 SDK UA；HTTP 直连/JWT key 直连 = 403。
@@ -154,6 +155,7 @@ Claude Code / Claude Desktop / 任意客户端
 | └ 502 耗时 <1s（如 340ms） | 上游**立即拒绝**：模型名不被 CloudBase 接受（未映射就透传）、请求体畸形 | 确认 `model: MODEL_MAP[b.model] \|\| 'hy3-preview'`（**不要**带 `\|\| b.model`，否则未登记名会透传被拒） |
 | └ 502 耗时 ~14s 且伴 `retry 1..3/3 ... 429` | CloudBase 成长计划额度/并发耗尽，退避重试 3 次仍失败；客户端频繁重试会放大成「重试风暴」 | 稍等额度恢复；避免 codex 与 WorkBuddy 同时高并发；必要时升级额度 |
 | 502 集中在一次部署前后 | `systemctl restart` 期间 origin 短暂下线，Cloudflare 隧道回 502 | 正常现象，重启完成即恢复；部署尽量少 restart |
+| codex 流式 `stream closed before response.completed` | 上游 prefill 期间网关未发任何字节，客户端连接 idle 超时被掐断 | 网关已修：响应头 + 即时 `: ping` + 心跳在 `await callUpstream` 之前发出。若仍现，抓 `[responses] IN / STREAM_DONE / RES_ENDED` 日志：网关发完 `response.completed`（日志 `completed=1` 且 `RES_ENDED`）说明是隧道/客户端侧超时；未发则看 `[responses][stream] FAIL` 取上游真因 |
 
 ---
 

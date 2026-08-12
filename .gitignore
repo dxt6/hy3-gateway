@@ -26,6 +26,10 @@ redo_token*.py
 select_perm*.py
 analyze_badreq*.py
 server_log_tmp.js
+# 排障/部署一次性脚本（仓库只保留 server.js 真源 + README；脚本仅本地部署用）
+patch_*.py
+test_sse_client.js
+quick.txt
 test_out/
 
 # ===== 日志 / 缓存 / 依赖 =====
