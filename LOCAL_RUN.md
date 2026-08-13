@@ -22,6 +22,7 @@ npm install @cloudbase/node-sdk ws
    - `CB_PROXY_AUTH` — 网关鉴权 Token（客户端请求必带，可自定随机串）
    - `LISTEN` — 本地填 `127.0.0.1`；需局域网/外网访问才改 `0.0.0.0`
    - `MAX_CONCURRENCY` — 默认 `4`
+   - `MAX_CTX_TOKENS` — 上下文软上限（token 估算，约 1 token ≈ 3 字符），**默认 `64000`**。上游 `hy3` 对超长上下文响应极慢（>100K token 需 1–2 分钟且偶发 500），客户端易超时报 `request failed`。超出上限时网关自动从头部删最旧轮次、并截断单条超长消息，把上游输入压短以提速。设 `0` 关闭裁剪（回到完全保留旧行为，仅建议排查时用）。
 3. （可选）设置 `SSL_CERT` / `SSL_KEY`（PEM 路径）即在本机 443 终止 TLS；本地一般留空用纯 HTTP。
 
 > 不想用 `.env.local` 也行：直接复制 `start_local_gateway.example.cmd` / `.sh` 为 `start_local_gateway.cmd` / `.sh`，把占位符改成真实值即可。
