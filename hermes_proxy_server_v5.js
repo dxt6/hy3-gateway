@@ -174,16 +174,26 @@ function anthropicToOpenAI(p){
   return out;
 }
 
-// ---------- 上下文保护（保守策略：默认 100% 保留，仅极端情况才动） ----------
+// ---------- 上下文保护 ----------
 const HARD_CTX_EST = 250000;   // 极端安全阀：仅当估算 > 250K 才考虑删最旧轮次
+const SOFT_CTX_EST = 40000;    // 软阈值：旧对话必卡的根因——上游 hy3 在 ~80K 上下文静默挂起；
+                               // 超过该阈值即从头部成对删最旧轮次，保留最近 KEEP 条，避免上游挂起（治本）
+const KEEP_CTX_MSGS = 60;      // 超出软阈值时，最多保留最近 N 条消息（旧的全丢，避免上游因 context 过大挂起）
 const SINGLE_TOOL_MAX = 32000; // 单条 tool_result 安全字符上限（远宽松于原 2000）
 function trimContext(payload){
   const msgs = payload.messages;
   if(!Array.isArray(msgs) || !msgs.length) return;
   const est = () => Math.ceil(JSON.stringify(msgs).length / 3);
+  const before = msgs.length, beforeEst = est();
   // 始终先做单条级压缩（只压超长 tool_result，不影响整体上下文）
   compressBigToolResults(msgs);
-  // 极端安全阀：仅在远超窗口时，从头部成对删除最旧轮次，并打告警日志
+  // 软阈值裁剪：旧对话（上下文大）上游易静默挂起 —— 保留最近 KEEP 条，丢最旧轮次（治本）
+  if(est() > SOFT_CTX_EST && msgs.length > KEEP_CTX_MSGS){
+    const drop = msgs.length - KEEP_CTX_MSGS;
+    msgs.splice(0, drop);
+    console.log('[hermes][WARN] context SOFT-TRIM dropped '+drop+' oldest msgs (est '+beforeEst+'—>'+est()+' tok), kept last '+msgs.length);
+  }
+  // 极端安全阀：仅在远超窗口时，进一步从头部成对删除，并打告警日志
   if(est() > HARD_CTX_EST){
     let i = 0, removed = 0;
     while(msgs.length > 4 && est() > HARD_CTX_EST && i < msgs.length - 2){
@@ -191,7 +201,6 @@ function trimContext(payload){
     }
     console.log('[hermes][WARN] context OVERSAFE-TRIM removed '+removed+' oldest msgs, now '+msgs.length+' msgs, est '+est()+' tok');
   }
-  // 正常会话（≤ 250K）完全不改动 messages，上下文 100% 保留
 }
 function compressBigToolResults(msgs){
   for(const m of msgs){
@@ -488,7 +497,7 @@ async function handleResponses( res, authOk, bodyStr ){
       // 一旦超过 STALL_MS 没收到任何上游 token（data: 行），主动取消上游并发 response.completed(failed) 让客户端停下/重试。
       let lastDataTs = Date.now();
       let stalled = false;
-      const STALL_MS = 150000;
+      const STALL_MS = 90000;
       const stallWatch = setInterval(()=>{
         if(stalled) return;
         if(Date.now() - lastDataTs > STALL_MS){
