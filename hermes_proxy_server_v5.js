@@ -5,6 +5,12 @@ const zlib = require('zlib');
 const tcb = require('@cloudbase/node-sdk');
 const WebSocket = require('ws');
 
+// ---- WS / 全局崩溃日志：之前 handleWsResponses 的 error/close 都是空处理，连接被悄悄掐掉时服务端不留痕，
+//      导致 codex 报 “Connection reset without closing handshake” 却无从排查。这里把日志打全 + 全局兜底。
+const wsLog = (...a)=>console.log('[hermes][WS] '+new Date().toISOString()+' '+a.join(' '));
+process.on('uncaughtException', (e)=>{ console.error('[FATAL][uncaughtException] '+(e&&e.stack||e)); });
+process.on('unhandledRejection', (e)=>{ console.error('[FATAL][unhandledRejection] '+(e&&e.stack||e)); });
+
 const ENV_ID = process.env.CB_ENV_ID || '';
 const SECRET_ID = process.env.CB_SID || '';
 const SECRET_KEY = process.env.CB_SKEY || '';
@@ -599,15 +605,37 @@ async function handleResponses( res, authOk, bodyStr ){
 // 连接保持，支持 codex 多轮复用。兼容 codex 同一轮内多次工具调用的「增量 input + previous_response_id」
 // （无状态网关无法缓存上一轮上下文，故在此按连接合并回完整 input）。
 function handleWsResponses(ws){
-  let lastInput = null; // 本连接上一次的完整 input 数组
+  const rid = 'ws_'+Date.now()+'_'+Math.random().toString(36).slice(2,7);
+  let lastInput = null;       // 本连接上一次的完整 input 数组
+  let alive = true;           // 连接是否仍活跃
+  let inFlight = null;        // 当前进行中的内部 http 请求（用于关闭时取消上游）
+  let frameCount = 0, completed = false, upStatus = 0;
+
+  // 关掉 Node 默认 2 分钟 socket 超时：长 prefill 期间 WS 静默，必须靠下面自己的 ping 保活
+  try{ if(ws._socket) ws._socket.setTimeout(0); }catch(_){}
+
+  // 应用层保活：每 15s 向客户端发一个 WS ping 控制帧（codex 自动回 pong），
+  // 让公网链路上 NAT/防火墙的 idle 计时持续被重置，避免 “Connection reset without closing handshake”。
+  const ka = setInterval(()=>{
+    if(!alive) return;
+    try{ if(ws.readyState===ws.OPEN) ws.ping(); }catch(e){ wsLog(rid,'ping-fail',(e&&e.message)||String(e)); }
+  }, 15000);
+  ws.on('pong', ()=>{}); // 客户端存活确认（ws 库自动回 pong，这里仅占位）
+
+  const cleanup = ()=>{ alive=false; try{ clearInterval(ka); }catch(_){} try{ if(inFlight) inFlight.destroy(); }catch(_){} };
+
+  wsLog(rid,'OPEN peer='+(ws._socket&&ws._socket.remoteAddress)+':'+(ws._socket&&ws._socket.remotePort));
+
   ws.on('message', (data)=>{
     let reqJson;
     try{ reqJson = JSON.parse(data.toString()); }
-    catch(e){ try{ ws.send(JSON.stringify({type:'error',status:400,error:{code:400,message:'invalid json'}})); }catch(_){} return; }
-    if(reqJson && reqJson.type==='response.create'){ delete reqJson.type; }
+    catch(e){ wsLog(rid,'BADJSON',(e&&e.message)||String(e)); try{ ws.send(JSON.stringify({type:'error',status:400,error:{code:400,message:'invalid json'}})); }catch(_){} return; }
+    if(reqJson && reqJson.type==='response.create'){ delete reqJson.type; wsLog(rid,'MSG type=response.create'); }
+    else { wsLog(rid,'MSG type='+(reqJson&&reqJson.type||'(none)')); }
     reqJson = reqJson || {};
     // codex 同一轮内多次工具调用会发「增量 input + previous_response_id」；合并回完整 input
     if(Array.isArray(reqJson.input) && lastInput && Array.isArray(lastInput) && reqJson.previous_response_id){
+      wsLog(rid,'MERGE prev='+reqJson.previous_response_id+' (last='+lastInput.length+' + new='+reqJson.input.length+')');
       reqJson.input = lastInput.concat(reqJson.input);
       delete reqJson.previous_response_id;
     }
@@ -615,31 +643,41 @@ function handleWsResponses(ws){
     const bodyStr = JSON.stringify(reqJson);
     if(Array.isArray(reqJson.input)) lastInput = reqJson.input;
     let buf='';
+    frameCount=0; completed=false; upStatus=0;
     const flush = ()=>{
       let idx;
       while((idx = buf.indexOf('\n')) >= 0){
         const line = buf.slice(0, idx); buf = buf.slice(idx+1);
         const t = line.trim();
+        if(!t) continue;
         if(t.startsWith('data:')){
           const p = t.slice(5).trim();
-          if(p && p!=='[DONE]'){ try{ ws.send(JSON.stringify(JSON.parse(p))); }catch(_){} }
+          if(p && p!=='[DONE]'){ try{ ws.send(JSON.stringify(JSON.parse(p))); frameCount++; if(p.indexOf('response.completed')>=0) completed=true; }catch(_){} }
+        } else if(t.startsWith(':')){
+          // SSE 注释（服务端保活帧）-> 转成 WS ping 帧，让客户端侧链路在 prefill 期间也保持活跃
+          try{ if(ws.readyState===ws.OPEN) ws.ping(); }catch(_){}
         }
       }
     };
+    wsLog(rid,'REQ start model='+(reqJson.model||'?')+' nMsgs='+(Array.isArray(reqJson.input)?reqJson.input.length:0));
     const httpReq = http.request({
       host:'127.0.0.1', port: PORT, path:'/responses', method:'POST',
       headers:{ 'Content-Type':'application/json', 'Authorization':'Bearer '+AUTH_TOKEN, 'Content-Length': Buffer.byteLength(bodyStr) }
     }, (upRes)=>{
+      upStatus = upRes.statusCode||0;
+      wsLog(rid,'UP status='+upStatus+' ct='+(upRes.headers['content-type']||''));
       upRes.setEncoding('utf-8');
       upRes.on('data', (chunk)=>{ buf += chunk; flush(); });
-      upRes.on('end', ()=>{ flush(); }); // 本轮结束，保持连接等待下一轮
-      upRes.on('error', (e)=>{ try{ ws.send(JSON.stringify({type:'error',status:502,error:{code:502,message:e.message}})); }catch(_){} });
+      upRes.on('end', ()=>{ flush(); wsLog(rid,'UP end frames='+frameCount+' completed='+completed); }); // 本轮结束，保持连接等待下一轮
+      upRes.on('error', (e)=>{ wsLog(rid,'UP-ERR',(e&&e.message)||String(e)); try{ ws.send(JSON.stringify({type:'error',status:502,error:{code:502,message:e.message}})); }catch(_){} });
     });
-    httpReq.on('error', (e)=>{ try{ ws.send(JSON.stringify({type:'error',status:502,error:{code:502,message:e.message}})); }catch(_){} });
+    inFlight = httpReq;
+    httpReq.on('error', (e)=>{ wsLog(rid,'REQ-ERR',(e&&e.message)||String(e)); try{ ws.send(JSON.stringify({type:'error',status:502,error:{code:502,message:e.message}})); }catch(_){} });
+    httpReq.on('close', ()=>{ inFlight=null; });
     httpReq.write(bodyStr); httpReq.end();
   });
-  ws.on('error', ()=>{});
-  ws.on('close', ()=>{});
+  ws.on('error', (e)=>{ wsLog(rid,'WS-ERR',(e&&e.message)||String(e), (e&&e.stack)?('| '+(e.stack.split('\n').slice(0,3).join(' '))):''); cleanup(); });
+  ws.on('close', (code, reason)=>{ wsLog(rid,'CLOSE code='+code+' reason='+(reason&&reason.toString()||'(empty)')); cleanup(); });
 }
 
 function handle(req,res){
@@ -660,7 +698,11 @@ function handle(req,res){
       res.writeHead(401,{'Content-Type':'application/json'}); return res.end(JSON.stringify({error:{message:'unauthorized'}}));
     }
     if(u==='/responses' || u==='/v1/responses'){
-      wss.handleUpgrade(req, req.socket, Buffer.alloc(0), (ws)=>{ console.log('[hermes][WS] upgrade ok path='+u); handleWsResponses(ws); });
+      wss.handleUpgrade(req, req.socket, Buffer.alloc(0), (ws)=>{
+        try{ if(ws._socket) ws._socket.setTimeout(0); }catch(_){}
+        wsLog('upgrade ok path='+u+' peer='+(req.socket&&req.socket.remoteAddress));
+        handleWsResponses(ws);
+      });
       return;
     }
     req.resume(); // 丢弃可能的请求体，避免连接挂起
@@ -750,6 +792,7 @@ if(req.method==='GET' && (url==='/'||url==='/v1'||url==='/health')){ res.writeHe
   });
 }
 const server=http.createServer(handle);
+server.timeout = 0; // 交给 WS 自身 ping 保活，避免 Node 默认 2 分钟超时误杀长 prefill 的 WS 连接
 // WebSocket 服务（noServer：由 handle 在 upgrade 分支里手动 handleUpgrade，复用同一 handle 逻辑）
 const wss = new WebSocket.Server({ noServer: true });
 wss.on('error', e=>console.error('[hermes][WS-ERR]', e.message));
