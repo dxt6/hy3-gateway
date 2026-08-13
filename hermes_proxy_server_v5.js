@@ -168,24 +168,39 @@ function anthropicToOpenAI(p){
   return out;
 }
 
-// ---------- 上下文保护（保守策略：默认 100% 保留，仅极端情况才动） ----------
-const HARD_CTX_EST = 250000;   // 极端安全阀：仅当估算 > 250K 才考虑删最旧轮次
-const SINGLE_TOOL_MAX = 32000; // 单条 tool_result 安全字符上限（远宽松于原 2000）
+// ---------- 上下文保护（软上限：避免长上下文把上游 hy3 拖慢到客户端超时） ----------
+// MAX_CTX_TOKENS：软上限（token 估算，约 1 token ≈ 3 字符）。超过则从头部成对删除最旧轮次，
+// 并由 compressBigToolResults 截断单条超长 tool_result。env 设为 0 可完全关闭裁剪（旧行为：100% 保留）。
+// 实测：hy3 上游对 >100K token 的输入响应需 1–2 分钟且偶发 500，客户端易超时 → 故默认压到 64K。
+const MAX_CTX_TOKENS = (()=>{ const v = parseInt(process.env.MAX_CTX_TOKENS, 10); return Number.isFinite(v) ? v : 64000; })();
+const SINGLE_TOOL_MAX = 32000; // 单条 tool_result 安全字符上限
+const SINGLE_MSG_MAX = 60000;  // 单条普通 user/assistant 文本安全字符上限
 function trimContext(payload){
   const msgs = payload.messages;
   if(!Array.isArray(msgs) || !msgs.length) return;
+  if(MAX_CTX_TOKENS <= 0) return; // 显式关闭裁剪
   const est = () => Math.ceil(JSON.stringify(msgs).length / 3);
-  // 始终先做单条级压缩（只压超长 tool_result，不影响整体上下文）
   compressBigToolResults(msgs);
-  // 极端安全阀：仅在远超窗口时，从头部成对删除最旧轮次，并打告警日志
-  if(est() > HARD_CTX_EST){
-    let i = 0, removed = 0;
-    while(msgs.length > 4 && est() > HARD_CTX_EST && i < msgs.length - 2){
-      msgs.splice(i, 2); removed += 2;
-    }
-    console.log('[hermes][WARN] context OVERSAFE-TRIM removed '+removed+' oldest msgs, now '+msgs.length+' msgs, est '+est()+' tok');
+  if(est() <= MAX_CTX_TOKENS) return; // 未超限，100% 保留
+  // 超过软上限：从头部成对删除最旧轮次（保留首条 system/developer 与最近轮）
+  let removed = 0, i = 0;
+  if(msgs[0] && (msgs[0].role==='system'||msgs[0].role==='developer')) i = 1;
+  while(msgs.length > 4 && est() > MAX_CTX_TOKENS && i < msgs.length - 2){
+    msgs.splice(i, 2); removed += 2;
   }
-  // 正常会话（≤ 250K）完全不改动 messages，上下文 100% 保留
+  // 若仍能删不动但整体仍超长（单条巨型文本），截断最长单条文本消息
+  if(est() > MAX_CTX_TOKENS){
+    for(const m of msgs){
+      const c = m.content;
+      if(typeof c === 'string' && c.length > SINGLE_MSG_MAX){
+        m.content = c.slice(0, SINGLE_MSG_MAX) + '\n...[gateway: message truncated to '+SINGLE_MSG_MAX+' chars]';
+        removed++;
+      } else if(Array.isArray(c)){
+        for(const b of c){ if(b && typeof b.text==='string' && b.text.length>SINGLE_MSG_MAX){ b.text = b.text.slice(0,SINGLE_MSG_MAX)+'\n...[gateway: truncated]'; } }
+      }
+    }
+  }
+  console.log('[hermes][WARN] context TRIM removed/truncated '+removed+' items, now '+msgs.length+' msgs, est '+est()+' tok (limit '+MAX_CTX_TOKENS+')');
 }
 function compressBigToolResults(msgs){
   for(const m of msgs){
