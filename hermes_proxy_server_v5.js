@@ -177,9 +177,32 @@ function anthropicToOpenAI(p){
 // ---------- 上下文保护 ----------
 const HARD_CTX_EST = 250000;   // 极端安全阀：仅当估算 > 250K 才考虑删最旧轮次
 const SOFT_CTX_EST = 40000;    // 软阈值：旧对话必卡的根因——上游 hy3 在 ~80K 上下文静默挂起；
-                               // 超过该阈值即从头部成对删最旧轮次，保留最近 KEEP 条，避免上游挂起（治本）
-const KEEP_CTX_MSGS = 60;      // 超出软阈值时，最多保留最近 N 条消息（旧的全丢，避免上游因 context 过大挂起）
+                               // 超过该阈值即压缩旧上下文（浓缩为摘要，而非整段删除），保留最近 KEEP 条
+const KEEP_CTX_MSGS = 60;      // 超出软阈值时，保留最近 N 条；更早的浓缩成一条 system 摘要前置
 const SINGLE_TOOL_MAX = 32000; // 单条 tool_result 安全字符上限（远宽松于原 2000）
+// 把被砍掉的旧消息确定性地提炼成“工具调用轨迹”摘要（不调上游，避免上游在大上下文上挂起）。
+// codex 这类写代码 agent 早期最该保留的就是“调过哪些工具 / 拿到什么结果”，纯文本对话正文反而不重要。
+function buildCompactSummary(dropped){
+  const bullets = [];
+  let pendName = null;
+  for(const m of dropped){
+    const c = m.content;
+    const arr = Array.isArray(c) ? c : (typeof c==='string' && c ? [{type:m.role==='tool'?'tool_result':'text', content:c}] : []);
+    for(const b of arr){
+      if(b.type==='function_call' || b.type==='custom_tool_call' || (b.function && b.function.name)){
+        pendName = b.name || (b.function&&b.function.name) || 'tool';
+      } else if(b.type==='tool_result' || b.type==='custom_tool_call_output' || m.role==='tool'){
+        const r = typeof (b.content!==undefined?b.content:b) === 'string' ? (b.content!==undefined?b.content:b) : JSON.stringify(b.content);
+        const snip = r.length>160 ? r.slice(0,160)+'…['+r.length+' chars]' : r;
+        bullets.push('- '+(pendName||'tool')+(pendName&&pendName.length?'':'')+(snip?(' → '+snip):' → (no result)'));
+        pendName = null;
+      }
+    }
+  }
+  const head = '[gateway auto-compacted] 为适配上游上下文上限，省略了最早的 '+dropped.length+' 条消息（原始对话正文已丢失）；该阶段保留的工具活动轨迹如下：';
+  if(bullets.length===0) return head + '（多为文本对话，无关键工具调用，可忽略）';
+  return head + '\n' + bullets.slice(0, 60).join('\n');
+}
 function trimContext(payload){
   const msgs = payload.messages;
   if(!Array.isArray(msgs) || !msgs.length) return;
@@ -187,11 +210,13 @@ function trimContext(payload){
   const before = msgs.length, beforeEst = est();
   // 始终先做单条级压缩（只压超长 tool_result，不影响整体上下文）
   compressBigToolResults(msgs);
-  // 软阈值裁剪：旧对话（上下文大）上游易静默挂起 —— 保留最近 KEEP 条，丢最旧轮次（治本）
+  // 软阈值压缩：旧对话（上下文大）上游易静默挂起 —— 保留最近 KEEP 条，更早的浓缩为一条 system 摘要前置
   if(est() > SOFT_CTX_EST && msgs.length > KEEP_CTX_MSGS){
     const drop = msgs.length - KEEP_CTX_MSGS;
-    msgs.splice(0, drop);
-    console.log('[hermes][WARN] context SOFT-TRIM dropped '+drop+' oldest msgs (est '+beforeEst+'—>'+est()+' tok), kept last '+msgs.length);
+    const dropped = msgs.splice(0, drop);            // 取出最旧 drop 条
+    const summary = buildCompactSummary(dropped);
+    msgs.unshift({ role:'system', content: summary }); // 前置摘要，模型仍能“记得”早期工具轨迹
+    console.log('[hermes][WARN] context COMPACT dropped '+drop+' oldest msgs (est '+beforeEst+'—>'+est()+' tok), kept last '+msgs.length+', injected summary '+(summary.length)+' chars');
   }
   // 极端安全阀：仅在远超窗口时，进一步从头部成对删除，并打告警日志
   if(est() > HARD_CTX_EST){
