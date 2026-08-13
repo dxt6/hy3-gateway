@@ -2,6 +2,7 @@
 apikey.txt
 proxy-keys.json
 local_gateway/
+域名/
 *.pem
 *.key
 

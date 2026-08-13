@@ -9,8 +9,8 @@
 
 | 项 | 值 |
 |---|---|
-| **推荐接入（生产·HTTPS 隧道）** | `https://hy3gateway.dxt116.dpdns.org`（Cloudflare Tunnel → 阿里云 8787，HTTPS，适合 WorkBuddy / codex 等走代理的客户端） |
-| 推荐接入（生产·公网直连） | `http://118.24.71.189:8787`（阿里云服务器，公网直连，本地零依赖） |
+| **推荐接入（生产·公网直连）** | `http://118.24.71.189:8787`（阿里云服务器，公网直连，**不受域名备案限制**，本地零依赖，适合 WorkBuddy / codex / Claude 等所有客户端） |
+| 备用接入（已停用·历史 502 源） | `https://hy3gateway.dxt116.dpdns.org`（Cloudflare Tunnel → 阿里云 8787；**已于 2026-08-13 停用**，且大陆未备案域名直连会被阿里云按 SNI 拦截，不建议再用） |
 | 备用接入 1 | 本地网关 `local_gateway/start_local_gateway.bat`（`http://127.0.0.1:8787`，仅依赖 CloudBase） |
 | 备用接入 2 | SSH 隧道 `start_tunnel_8787.bat`（本地 8787 → 阿里云 8787，公网端口被封时用） |
 | 网关版本 | **v5.3**（`hermes_proxy_server_v5.js`），模型映射目标 **hy3-preview** |
@@ -32,7 +32,7 @@ API Key:  <CB_PROXY_AUTH 的值>
 ### codex / OpenAI Responses API 客户端
 网关额外实现了 OpenAI **Responses API** 端点 `/responses`（以及 `/v1/responses`），专供 codex 及任何走 Responses API 的客户端：
 ```
-Base URL: https://hy3gateway.dxt116.dpdns.org        （或 http://118.24.71.189:8787）
+Base URL: http://118.24.71.189:8787
 API Key:  <CB_PROXY_AUTH 的值>
 模型:     任意（统一回落 hy3-preview，含 o4-mini / gpt-5-codex 等未登记名）
 ```
@@ -40,7 +40,7 @@ API Key:  <CB_PROXY_AUTH 的值>
 - 流式返回**完整标准 Responses SSE 事件序列（9 个）**：`response.created → response.in_progress → response.output_item.added → response.content_part.added → response.output_text.delta* → response.output_text.done → response.content_part.done → response.output_item.done → response.completed`。
   - **协议要点（codex 严格客户端实测验证）**：每个事件的 `data` 必须带**顶层 `type` 字段**（与事件名一致，codex 按 `data.type` 分发）；`response.created / response.in_progress / response.completed` 三个事件的 payload 必须把整个 response 对象**嵌套在 `response` 字段**里（`{"type":"response.completed","response":{...}}`），不能平铺顶层——否则 codex 报 `stream closed before response.completed`。
 - 模型名不认时统一回落 `hy3-preview`（网关本质单后端 hy3-preview 代理），避免上游拒绝。
-- **codex 0.147 默认 WebSocket 优先**：会先 `wss://.../responses` 升级（网关不支持 WS → 502），重试 5 次后才回退 HTTPS，每次请求白等 ~15s。为免空等，codex 侧 `~/.codex/config.toml` 需用自定义 provider 且 `supports_websockets = false`：`base_url` 指向隧道、`wire_api="responses"`、`experimental_bearer_token` 用网关 token（CB_PROXY_AUTH 值）。**网关侧双保险**：`handle` 现已对 WebSocket 升级请求（`Connection: Upgrade`）直接返回 426，即使客户端仍发 WS 也会立刻回退 HTTPS，不再卡 5 次(~15s)重试风暴（2026-08-13 15:24 部署）。
+- **codex 0.147 默认 WebSocket 优先**：会先 `wss://.../responses` 升级（网关不支持 WS → 502），重试 5 次后才回退 HTTPS，每次请求白等 ~15s。为免空等，codex 侧 `~/.codex/config.toml` 需用自定义 provider 且 `supports_websockets = false`：`base_url` 指向隧道、`wire_api="responses"`、`experimental_bearer_token` 用网关 token（CB_PROXY_AUTH 值）。**网关侧双保险**：`handle` 现已对 WebSocket 升级请求（`Connection: Upgrade`）直接返回 426，即使客户端仍发 WS 也会立刻回退 HTTPS，不再卡 5 次(~15s)重试风暴（2026-08-13 15:24 部署）。**注：Cloudflared 隧道已于 2026-08-13 停用，WS 经隧道 502 这道坑随之消失；426 守卫仍保留，仅对直连网关的 WS 升级生效（兜底）。当前 codex 走 `openai_http` provider（HTTPS-only，不发 WS），最稳。**
 
 ---
 
@@ -165,7 +165,7 @@ Claude Code / Claude Desktop / 任意客户端
 | 502 | **先看日志里的耗时，能直接区分根因**（`journalctl -u hermes-proxy \| grep 502`） | 见下两行 |
 | └ 502 耗时 <1s（如 340ms） | 上游**立即拒绝**：模型名不被 CloudBase 接受（未映射就透传）、请求体畸形 | 确认 `model: MODEL_MAP[b.model] \|\| 'hy3-preview'`（**不要**带 `\|\| b.model`，否则未登记名会透传被拒） |
 | └ 502 耗时 ~14s 且伴 `retry 1..3/3 ... 429` | CloudBase 成长计划额度/并发耗尽，退避重试 3 次仍失败；客户端频繁重试会放大成「重试风暴」 | 稍等额度恢复；避免 codex 与 WorkBuddy 同时高并发；必要时升级额度 |
-| 502 集中在一次部署前后 | `systemctl restart` 期间 origin 短暂下线，Cloudflare 隧道回 502 | 正常现象，重启完成即恢复；部署尽量少 restart |
+| 502 集中在一次部署前后 | （历史）`systemctl restart` 期间 origin 短暂下线 + Cloudflare 隧道回 502；**Cloudflared 隧道已于 2026-08-13 停用，此条不再适用**。现仅偶发上游抖动或部署重启瞬间，重启完成即恢复 | 部署尽量少 restart；如仍 502 优先看耗时区分上游瞬时错 |
 | codex 流式 `stream closed before response.completed` | 上游 prefill 期间网关未发任何字节，客户端连接 idle 超时被掐断 | 网关已修：响应头 + 即时 `: ping` + 心跳在 `await callUpstream` 之前发出。若仍现，抓 `[responses] IN / STREAM_DONE / RES_ENDED` 日志：网关发完 `response.completed`（日志 `completed=1` 且 `RES_ENDED`）说明是隧道/客户端侧超时；未发则看 `[responses][stream] FAIL` 取上游真因 |
 | `Error Code:10000` / `code:-32603 Internal error` / `data.category:"internal"` | 上游 CloudBase(hy3) **瞬时内部错误**，网关原样透传。与 502 同类，多为偶发 | 网关已加固：`callUpstream` 对 -32603/5xx/network 类自动重试 1-2 次（直接吸收），并打 `[hermes][UPSTREAM-ERR]` 日志。**用户侧直接重试即可**；若持续出现才需排查上游额度/模型状态 |
 

@@ -1,6 +1,9 @@
 const http = require('http');
+const https = require('https');
+const fs = require('fs');
 const zlib = require('zlib');
 const tcb = require('@cloudbase/node-sdk');
+const WebSocket = require('ws');
 
 const ENV_ID = process.env.CB_ENV_ID || '';
 const SECRET_ID = process.env.CB_SID || '';
@@ -591,18 +594,78 @@ async function handleResponses( res, authOk, bodyStr ){
   }
 }
 
+// WS 模式（codex 专用）：把每个 WS 消息当作一次 /responses 请求，内部转发给本机 HTTP /responses
+// （复用现有 SSE 逻辑，强制 stream:true），再把 SSE 每行 data: 载荷原样作为 WS 文本帧发回。
+// 连接保持，支持 codex 多轮复用。兼容 codex 同一轮内多次工具调用的「增量 input + previous_response_id」
+// （无状态网关无法缓存上一轮上下文，故在此按连接合并回完整 input）。
+function handleWsResponses(ws){
+  let lastInput = null; // 本连接上一次的完整 input 数组
+  ws.on('message', (data)=>{
+    let reqJson;
+    try{ reqJson = JSON.parse(data.toString()); }
+    catch(e){ try{ ws.send(JSON.stringify({type:'error',status:400,error:{code:400,message:'invalid json'}})); }catch(_){} return; }
+    if(reqJson && reqJson.type==='response.create'){ delete reqJson.type; }
+    reqJson = reqJson || {};
+    // codex 同一轮内多次工具调用会发「增量 input + previous_response_id」；合并回完整 input
+    if(Array.isArray(reqJson.input) && lastInput && Array.isArray(lastInput) && reqJson.previous_response_id){
+      reqJson.input = lastInput.concat(reqJson.input);
+      delete reqJson.previous_response_id;
+    }
+    reqJson.stream = true; // 强制流式，确保事件逐条返回
+    const bodyStr = JSON.stringify(reqJson);
+    if(Array.isArray(reqJson.input)) lastInput = reqJson.input;
+    let buf='';
+    const flush = ()=>{
+      let idx;
+      while((idx = buf.indexOf('\n')) >= 0){
+        const line = buf.slice(0, idx); buf = buf.slice(idx+1);
+        const t = line.trim();
+        if(t.startsWith('data:')){
+          const p = t.slice(5).trim();
+          if(p && p!=='[DONE]'){ try{ ws.send(JSON.stringify(JSON.parse(p))); }catch(_){} }
+        }
+      }
+    };
+    const httpReq = http.request({
+      host:'127.0.0.1', port: PORT, path:'/responses', method:'POST',
+      headers:{ 'Content-Type':'application/json', 'Authorization':'Bearer '+AUTH_TOKEN, 'Content-Length': Buffer.byteLength(bodyStr) }
+    }, (upRes)=>{
+      upRes.setEncoding('utf-8');
+      upRes.on('data', (chunk)=>{ buf += chunk; flush(); });
+      upRes.on('end', ()=>{ flush(); }); // 本轮结束，保持连接等待下一轮
+      upRes.on('error', (e)=>{ try{ ws.send(JSON.stringify({type:'error',status:502,error:{code:502,message:e.message}})); }catch(_){} });
+    });
+    httpReq.on('error', (e)=>{ try{ ws.send(JSON.stringify({type:'error',status:502,error:{code:502,message:e.message}})); }catch(_){} });
+    httpReq.write(bodyStr); httpReq.end();
+  });
+  ws.on('error', ()=>{});
+  ws.on('close', ()=>{});
+}
+
 function handle(req,res){
   const chunks=[];
   const __t0=Date.now();
   res.on('finish',()=>{ if(res.statusCode!==200){ console.log(req.method+' '+req.url.split('?')[0]+' -> '+res.statusCode+' ('+(Date.now()-__t0)+'ms)'); } });
-  // WebSocket 升级请求：网关是纯 HTTPS/SSE，不支持 WS。codex 0.147 默认 WS 优先，
-  // 即便 config 写了 supports_websockets=false，自定义 provider 上仍可能尝试 wss://.../responses；
-  // Cloudflare 隧道对 WS 升级稳定 502，codex 重试 5 次(~15s)才回退 HTTPS → “调工具就自动停”/WS 502。
-  // 这里直接 426 让 codex 立即放弃 WS、走 HTTPS，彻底消除重试风暴（不依赖客户端 config）。
+  // WebSocket：codex 0.147+ 的 WS 模式（Responses API over WebSocket，专用于降低 agent 循环延迟）。
+  // 协议（已对照 openai/codex 源码验证）：
+  //   客户端→服务端：每轮一个 TEXT 帧 = 标准 Responses 请求 JSON + 顶层 "type":"response.create"（转发前剥掉）。
+  //   服务端→客户端：每个 TEXT 帧 = 一个裸 response.* 事件 JSON（与 SSE 的 data: 载荷完全相同，仅去掉 data: 前缀与 SSE 封装）。
+  //   收到 response.completed 即本轮结束，连接保持复用多轮。
+  // 仅 /responses、/v1/responses 支持 WS；其余路径仍 426。
   if((req.headers['upgrade']||'').toLowerCase().includes('websocket')){
+    const u = (req.url||'').split('?')[0];
+    const auth = (req.headers['authorization']||req.headers['Authorization']||'');
+    const token = auth.startsWith('Bearer ')?auth.slice(7):(auth||'');
+    if(AUTH_TOKEN && token.trim()!==AUTH_TOKEN){
+      res.writeHead(401,{'Content-Type':'application/json'}); return res.end(JSON.stringify({error:{message:'unauthorized'}}));
+    }
+    if(u==='/responses' || u==='/v1/responses'){
+      wss.handleUpgrade(req, req.socket, Buffer.alloc(0), (ws)=>{ console.log('[hermes][WS] upgrade ok path='+u); handleWsResponses(ws); });
+      return;
+    }
     req.resume(); // 丢弃可能的请求体，避免连接挂起
     res.writeHead(426,{'Content-Type':'application/json','Connection':'close'});
-    return res.end(JSON.stringify({error:{message:'websocket not supported; client should use HTTPS'}}));
+    return res.end(JSON.stringify({error:{message:'websocket not supported for this path'}}));
   }
   req.on('data',c=>chunks.push(c));
   req.on('end',async()=>{
@@ -644,21 +707,28 @@ if(req.method==='GET' && (url==='/'||url==='/v1'||url==='/health')){ res.writeHe
       if(stream){
         const streamObj = await callUpstream(payload, true);
         res.writeHead(200,{'Content-Type':'text/event-stream; charset=utf-8','Cache-Control':'no-cache','Connection':'keep-alive','Transfer-Encoding':'chunked','X-Accel-Buffering':'no'});
+        // 保活：prefill 期间上游可能数十秒无字节，客户端/代理 idle 超时仍会掐断长 SSE 流；
+        // 周期发 SSE 注释（: 开头，客户端忽略但重置 idle 计时），流收尾时清除。
+        let hbCleared=false;
+        const clearHb=()=>{ if(!hbCleared){ hbCleared=true; try{ clearInterval(hb); }catch(_){} } };
+        const hb=setInterval(()=>{ try{ res.write(': ping\n\n'); }catch(_){} }, 3000);
+        const reader = streamObj.getReader();
+        const decoder = new TextDecoder('utf-8');
         if(isAnthropic){
-          const reader = streamObj.getReader();
-          const decoder = new TextDecoder('utf-8');
-          streamOpenAIToAnthropic(reader, decoder, res, reqModel).catch(e=>{ if(!res.writableEnded) res.end(); });
+          streamOpenAIToAnthropic(reader, decoder, res, reqModel)
+            .catch(e=>{ if(!res.writableEnded) res.end(); })
+            .finally(clearHb);
         } else {
-          const reader = streamObj.getReader();
-          const decoder = new TextDecoder('utf-8');
           (async()=>{
-            while(true){
-              const { done, value } = await reader.read();
-              if(done) break;
-              res.write(decoder.decode(value, { stream:true }));
-            }
-            res.end();
-          })().catch(()=>res.end());
+            try{
+              while(true){
+                const { done, value } = await reader.read();
+                if(done) break;
+                res.write(decoder.decode(value, { stream:true }));
+              }
+            } finally { clearHb(); }
+            if(!res.writableEnded) res.end();
+          })().catch(()=>{ clearHb(); if(!res.writableEnded) res.end(); });
         }
       } else {
         const r = await callUpstream(payload, false);
@@ -680,4 +750,26 @@ if(req.method==='GET' && (url==='/'||url==='/v1'||url==='/health')){ res.writeHe
   });
 }
 const server=http.createServer(handle);
+// WebSocket 服务（noServer：由 handle 在 upgrade 分支里手动 handleUpgrade，复用同一 handle 逻辑）
+const wss = new WebSocket.Server({ noServer: true });
+wss.on('error', e=>console.error('[hermes][WS-ERR]', e.message));
 server.listen(PORT, process.env.LISTEN || '127.0.0.1', ()=>console.log('hermes-proxy v5 (env='+ENV_ID+') on '+process.env.LISTEN||'127.0.0.1'+':'+PORT));
+
+// ---------- 可选 HTTPS 层（域名直连，绕过 Cloudflare Tunnel 以免长 SSE 流被掐断） ----------
+// 设置 SSL_CERT / SSL_KEY（PEM 路径）即在本机终止 TLS，监听 443，复用同一 handle。
+// 不设置则只跑 HTTP :8787，行为完全不变（可逆）。
+const SSL_CERT = process.env.SSL_CERT || '';
+const SSL_KEY  = process.env.SSL_KEY  || '';
+if (SSL_CERT && SSL_KEY) {
+  try {
+    const tlsOpts = { cert: fs.readFileSync(SSL_CERT), key: fs.readFileSync(SSL_KEY) };
+    const httpsServer = https.createServer(tlsOpts, handle);
+    const HTTPS_PORT = parseInt(process.env.HTTPS_PORT || '443', 10);
+    httpsServer.listen(HTTPS_PORT, process.env.LISTEN || '0.0.0.0', ()=>{
+      console.log('hermes-proxy v5 HTTPS on :'+HTTPS_PORT+' (env='+ENV_ID+')');
+    });
+    httpsServer.on('error', e=>console.error('[hermes][HTTPS-ERR]', e.message));
+  } catch(e) {
+    console.error('[hermes][HTTPS] 启动失败，仅 HTTP 可用：', e.message);
+  }
+}
