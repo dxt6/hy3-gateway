@@ -576,6 +576,15 @@ function handle(req,res){
   const chunks=[];
   const __t0=Date.now();
   res.on('finish',()=>{ if(res.statusCode!==200){ console.log(req.method+' '+req.url.split('?')[0]+' -> '+res.statusCode+' ('+(Date.now()-__t0)+'ms)'); } });
+  // WebSocket 升级请求：网关是纯 HTTPS/SSE，不支持 WS。codex 0.147 默认 WS 优先，
+  // 即便 config 写了 supports_websockets=false，自定义 provider 上仍可能尝试 wss://.../responses；
+  // Cloudflare 隧道对 WS 升级稳定 502，codex 重试 5 次(~15s)才回退 HTTPS → “调工具就自动停”/WS 502。
+  // 这里直接 426 让 codex 立即放弃 WS、走 HTTPS，彻底消除重试风暴（不依赖客户端 config）。
+  if((req.headers['upgrade']||'').toLowerCase().includes('websocket')){
+    req.resume(); // 丢弃可能的请求体，避免连接挂起
+    res.writeHead(426,{'Content-Type':'application/json','Connection':'close'});
+    return res.end(JSON.stringify({error:{message:'websocket not supported; client should use HTTPS'}}));
+  }
   req.on('data',c=>chunks.push(c));
   req.on('end',async()=>{
     const rawBody = Buffer.concat(chunks);
