@@ -265,7 +265,6 @@ function responsesToChat( body ){
   if(b.top_p !== undefined) out.top_p = b.top_p;
   const normTool = (t)=>{ const f = t.function || t; return { type:'function', function:{ name:f.name||'', description:f.description||'', parameters:f.parameters||f.input_schema||{type:'object',properties:{}} } }; };
   const input = b.input;
-  const customTools = []; // additional_tools 里的 non-function 工具（如 codex 的 custom exec），网关/上游无法真执行，降级为系统消息
   const pushText = (role, text)=>{ if(text) out.messages.push({ role, content: text }); };
   const pushImgs = (role, imgs)=>{
     if(!imgs.length) return;
@@ -283,8 +282,29 @@ function responsesToChat( body ){
       if(it.type==='additional_tools' && Array.isArray(it.tools)){
         for(const t of it.tools){
           if(t.type==='function' || t.function){ if(!out.tools) out.tools=[]; out.tools.push(normTool(t)); }
-          else { customTools.push({ name:t.name, description:t.description, parameters: t.parameters||t.input_schema }); }
+          else {
+            // 把 custom 工具（如 codex 的 exec）也暴露为 function 工具，让上游能正式发起 tool_call；
+            // 网关只转发 tool_call，实际执行在客户端（codex 本地 V8），description 截断控制请求体大小
+            if(!out.tools) out.tools=[];
+            out.tools.push({ type:'function', function:{ name: t.name||('custom_'+((out.tools||[]).length+1)), description: (t.description||'').slice(0,500), parameters: t.input_schema||t.parameters||{ type:'object', properties:{ code:{ type:'string', description:'JavaScript source code to evaluate' } }, required:['code'] } } });
+          }
         }
+        continue;
+      }
+      // ---- 多轮工具结果：function_call/custom_tool_call（assistant 发起的工具调用）与 *_output（工具返回）----
+      if(it.type==='function_call' || it.type==='custom_tool_call'){
+        // 上游 hy3 要求 tool_calls[].arguments 是 JSON 对象（会 json.loads(...).items()）：
+        // custom 工具的原始 input 字符串要包成 {code: ...} 对象，function 工具的 arguments 保持原样
+        const args = it.type==='custom_tool_call'
+          ? (typeof it.input==='string' ? JSON.stringify({code: it.input}) : JSON.stringify(it.input||{}))
+          : (typeof it.arguments==='string' ? it.arguments : JSON.stringify(it.arguments||{}));
+        const cid = it.call_id || ('call_'+Math.random().toString(36).slice(2,12));
+        out.messages.push({ role:'assistant', content:null, tool_calls:[{ id:cid, type:'function', function:{ name: it.name||'', arguments: args } }] });
+        continue;
+      }
+      if(it.type==='function_call_output' || it.type==='custom_tool_call_output'){
+        const c = typeof it.output==='string' ? it.output : JSON.stringify(it.output||'');
+        out.messages.push({ role:'tool', tool_call_id: it.call_id||'', content: c });
         continue;
       }
       let role = (it.role==='system'||it.role==='developer')?'system':((it.role==='assistant')?'assistant':'user');
@@ -304,11 +324,6 @@ function responsesToChat( body ){
   if(Array.isArray(b.tools)){
     if(!out.tools) out.tools=[];
     for(const t of b.tools){ if(t&&(t.type==='function'||t.function)) out.tools.push(normTool(t)); }
-  }
-  // 把所有 custom 工具降级成一条系统消息，让模型“知道”有这能力（hy3 不支持真执行）
-  if(customTools.length){
-    const desc = customTools.map(c=>'- '+(c.name||'?')+(c.description?': '+c.description:'')).join(String.fromCharCode(10));
-    out.messages.unshift({ role:'system', content:'[gateway] 客户端声明了以下 custom 工具（当前网关无法真实执行，请用自然语言说明意图即可）：'+String.fromCharCode(10)+desc });
   }
   // tool_choice 守卫：仅当确有可用 function 工具时才保留；否则上游 chat/completions 会报 “tools is required when tool_choice is set” -> 502
   if(b.tool_choice){
@@ -358,13 +373,37 @@ async function handleResponses( res, authOk, bodyStr ){
   catch(e){ res.writeHead(400,{'Content-Type':'application/json'}); return res.end(JSON.stringify({error:{message:'bad json'}})); }
   const chat = responsesToChat(payload);
   const reqModel = chat.model;
-  console.log('[responses] IN model='+(payload&&payload.model)+' stream='+(!!(payload&&payload.stream))+' nMsgs='+(Array.isArray(payload&&payload.input)?payload.input.length:0)+' body='+JSON.stringify(payload).slice(0,1500));
+  // custom 工具名单（由网关暴露为 function 工具）：codex 的 exec 要求参数是原始 JS 字符串而非 JSON 对象，
+  // 转发 tool_call 时对 {code:...}/{string:...} 单键对象解包
+  const customNames = new Set();
+  for(const it of (Array.isArray(payload&&payload.input)?payload.input:[])){
+    if(it && it.type==='additional_tools' && Array.isArray(it.tools)){
+      for(const t of it.tools){ if(t && t.type!=='function' && !t.function && t.name) customNames.add(t.name); }
+    }
+  }
+  const unwrapArgs = (name, argsStr)=>{
+    if(!customNames.has(name)) return argsStr;
+    // codex 的 custom 工具（exec）把 arguments 当原始输入：JSON 字符串要解引号、{code}/{string} 单键对象要取内层值
+    try{
+      const p = JSON.parse(argsStr);
+      if(typeof p === 'string') return p;
+      if(p && typeof p==='object' && !Array.isArray(p)){
+        const ks = Object.keys(p);
+        if(ks.length===1 && (ks[0]==='code'||ks[0]==='string')) return String(p[ks[0]]);
+      }
+    }catch(_){}
+    return argsStr;
+  };
+  const toolDefs = JSON.stringify((Array.isArray(payload&&payload.input)?payload.input:[]).filter(it=>it&&it.type==='additional_tools'&&Array.isArray(it.tools)).map(it=>it.tools.map(t=>({type:t&&t.type,name:t&&t.name,schema:t&&(t.input_schema||t.parameters)||null})))).slice(0,2000);
+  console.log('[responses] TOOLDEFS '+toolDefs);
+  console.log('[responses] CHAT model='+chat.model+' tools='+((chat.tools||[]).length)+' tc='+JSON.stringify(chat.tool_choice||null)+' mt='+(chat.max_tokens||'-')+' msgs='+(chat.messages||[]).length+' stream='+!!chat.stream);
+  console.log('[responses] IN model='+(payload&&payload.model)+' stream='+(!!(payload&&payload.stream))+' nMsgs='+(Array.isArray(payload&&payload.input)?payload.input.length:0)+' body='+JSON.stringify(payload).slice(0,4000));
   try{
     if(chat.stream){
       // 立即发响应头 + 保活：上游 prefill 期间（codex 长上下文可达数十秒）客户端若一直收不到字节，会被 Cloudflare/客户端 idle 超时掐断 -> "stream closed before response.completed"
       res.writeHead(200,{'Content-Type':'text/event-stream; charset=utf-8','Cache-Control':'no-cache','Connection':'keep-alive','Transfer-Encoding':'chunked','X-Accel-Buffering':'no'});
       const decoder = new TextDecoder('utf-8');
-      let buf=''; let text=''; let deltaCount=0;
+      let buf=''; let text=''; let deltaCount=0; let toolCalls={};
       const push = (evt, data)=>{ const d = Object.assign({}, data, { type: evt }); res.write('event: '+evt+'\n'); res.write('data: '+JSON.stringify(d)+'\n\n'); };
       const rid = 'resp_'+Date.now();
       const iid = 'msg_'+rid, pid = 'part_'+rid;
@@ -405,16 +444,60 @@ async function handleResponses( res, authOk, bodyStr ){
               let j; try{ j = JSON.parse(d); }catch(e){ continue; }
               const dc = j.choices && j.choices[0] && j.choices[0].delta;
               if(dc && dc.content){ text += dc.content; deltaCount++; push('response.output_text.delta', { item_id:iid, output_index:0, content_index:0, delta: dc.content }); }
+              // ---- 工具调用：把上游 chat 格式的 delta.tool_calls 转成 Responses function_call 事件 ----
+              if(dc && (dc.tool_calls || dc.function_call)){
+                const tcs = dc.tool_calls || (dc.function_call ? [{index:0,function:dc.function_call}] : []);
+                for(const tc of tcs){
+                  const idx = (tc.index!=null?tc.index:0);
+                  const prevArgs = (toolCalls[idx]&&toolCalls[idx].args)||'';
+                  if(!toolCalls[idx]) toolCalls[idx] = { id:'fc_'+rid+'_'+idx, name:'', args:'', added:false };
+                  const t = toolCalls[idx];
+                  if(tc.function && tc.function.name) t.name = tc.function.name;
+                  if(tc.function && tc.function.arguments) t.args += tc.function.arguments;
+                  if(!t.added && t.name){
+                    t.added = true;
+                    if(customNames.has(t.name)){
+                      // custom 工具（如 codex 的 exec）：Responses 规范用 custom_tool_call 项，input 为原始输入
+                      push('response.output_item.added', { output_index: idx+1, item:{ id:t.id, type:'custom_tool_call', status:'in_progress', name:t.name, input:'', call_id:'call_'+t.id } });
+                    } else {
+                      push('response.output_item.added', { output_index: idx+1, item:{ id:t.id, type:'function_call', status:'in_progress', name:t.name, arguments:'', call_id:'call_'+t.id } });
+                    }
+                  }
+                  if(!customNames.has(t.name) && t.args.length > prevArgs.length){
+                    push('response.function_call_arguments.delta', { item_id:t.id, output_index: idx+1, delta: t.args.slice(prevArgs.length) });
+                  }
+                }
+              }
             }
             }
           }
           clearHb();
           const outText = text || '';
-          console.log('[responses] STREAM_DONE model='+reqModel+' completed=1 deltas='+deltaCount+' textLen='+(text?text.length:0));
+          console.log('[responses] STREAM_DONE model='+reqModel+' completed=1 deltas='+deltaCount+' textLen='+(text?text.length:0)+' tools='+Object.keys(toolCalls).length);
           push('response.output_text.done', { item_id:iid, output_index:0, content_index:0, text: outText });
           push('response.content_part.done', { item_id:iid, output_index:0, content_index:0, part:{ type:'output_text', text: outText, annotations:[] } });
           push('response.output_item.done', { output_index:0, item:{ id:iid, type:'message', status:'completed', role:'assistant', content:[{type:'output_text', text: outText, annotations:[]}] } });
-          push('response.completed', { response: { id:rid, object:'response', status:'completed', model:reqModel, output:[{type:'message',status:'completed',role:'assistant',content:[{type:'output_text',text: outText, annotations:[]}]}], usage:null } });
+          // 收尾每个 function_call item（arguments.done + output_item.done），并纳入 completed.output
+          const fcItems = [];
+          const fcIdxs = Object.keys(toolCalls).map(Number).sort((a,b)=>a-b);
+          for(const idx of fcIdxs){
+            const t = toolCalls[idx];
+            const oi = idx+1;
+            const finalArgs = unwrapArgs(t.name, t.args);
+            if(customNames.has(t.name)){
+              push('response.custom_tool_call_input.done', { item_id:t.id, output_index:oi, input:finalArgs });
+              push('response.output_item.done', { output_index:oi, item:{ id:t.id, type:'custom_tool_call', status:'completed', name:t.name, input:finalArgs, call_id:'call_'+t.id, output:'' } });
+              fcItems.push({ type:'custom_tool_call', status:'completed', name:t.name, input:finalArgs, call_id:'call_'+t.id, output:'' });
+            } else {
+              push('response.function_call_arguments.done', { item_id:t.id, output_index:oi, arguments:finalArgs });
+              push('response.output_item.done', { output_index:oi, item:{ id:t.id, type:'function_call', status:'completed', name:t.name, arguments:finalArgs, call_id:'call_'+t.id, output:'' } });
+              fcItems.push({ type:'function_call', status:'completed', name:t.name, arguments:finalArgs, call_id:'call_'+t.id, output:'' });
+            }
+          }
+          const outItems = [];
+          if(outText) outItems.push({ type:'message', status:'completed', role:'assistant', content:[{type:'output_text', text: outText, annotations:[]}] });
+          for(const fi of fcItems) outItems.push(fi);
+          push('response.completed', { response: { id:rid, object:'response', status:'completed', model:reqModel, output: outItems, usage:null } });
           res.end(()=>{ console.log('[responses] RES_ENDED model='+reqModel+' completed=1'); });
         }catch(e){
           clearHb();
@@ -423,9 +506,28 @@ async function handleResponses( res, authOk, bodyStr ){
             const outText = text || '';
             console.log('[responses] STREAM_DONE model='+reqModel+' completed=0 deltas='+deltaCount+' err='+((e&&e.message)||String(e)));
             push('response.output_text.done', { item_id:iid, output_index:0, content_index:0, text: outText });
-          push('response.content_part.done', { item_id:iid, output_index:0, content_index:0, part:{ type:'output_text', text: outText, annotations:[] } });
+            push('response.content_part.done', { item_id:iid, output_index:0, content_index:0, part:{ type:'output_text', text: outText, annotations:[] } });
             push('response.output_item.done', { output_index:0, item:{ id:iid, type:'message', status:'completed', role:'assistant', content:[{type:'output_text', text: outText, annotations:[]}] } });
-            push('response.completed', { response: { id:rid, object:'response', status:'completed', model:reqModel, output:[{type:'message',status:'completed',role:'assistant',content:[{type:'output_text',text: outText, annotations:[]}]}], usage:null } });
+            const fcItems = [];
+            const fcIdxs = Object.keys(toolCalls).map(Number).sort((a,b)=>a-b);
+            for(const idx of fcIdxs){
+              const t = toolCalls[idx];
+              const oi = idx+1;
+              const finalArgs = unwrapArgs(t.name, t.args);
+              if(customNames.has(t.name)){
+                push('response.custom_tool_call_input.done', { item_id:t.id, output_index:oi, input:finalArgs });
+                push('response.output_item.done', { output_index:oi, item:{ id:t.id, type:'custom_tool_call', status:'completed', name:t.name, input:finalArgs, call_id:'call_'+t.id, output:'' } });
+                fcItems.push({ type:'custom_tool_call', status:'completed', name:t.name, input:finalArgs, call_id:'call_'+t.id, output:'' });
+              } else {
+                push('response.function_call_arguments.done', { item_id:t.id, output_index:oi, arguments:finalArgs });
+                push('response.output_item.done', { output_index:oi, item:{ id:t.id, type:'function_call', status:'completed', name:t.name, arguments:finalArgs, call_id:'call_'+t.id, output:'' } });
+                fcItems.push({ type:'function_call', status:'completed', name:t.name, arguments:finalArgs, call_id:'call_'+t.id, output:'' });
+              }
+            }
+            const outItems = [];
+            if(outText) outItems.push({ type:'message', status:'completed', role:'assistant', content:[{type:'output_text', text: outText, annotations:[]}] });
+            for(const fi of fcItems) outItems.push(fi);
+            push('response.completed', { response: { id:rid, object:'response', status:'completed', model:reqModel, output: outItems, usage:null } });
             res.end(()=>{ console.log('[responses] RES_ENDED model='+reqModel+' completed=0'); });
           }
         }
