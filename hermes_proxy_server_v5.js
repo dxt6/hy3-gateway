@@ -284,9 +284,10 @@ function responsesToChat( body ){
           if(t.type==='function' || t.function){ if(!out.tools) out.tools=[]; out.tools.push(normTool(t)); }
           else {
             // 把 custom 工具（如 codex 的 exec）也暴露为 function 工具，让上游能正式发起 tool_call；
-            // 网关只转发 tool_call，实际执行在客户端（codex 本地 V8），description 截断控制请求体大小
+            // 网关只转发 tool_call，实际执行在客户端（codex 本地 V8）。description 必须完整传给上游——
+            // exec 的正确用法（text() 输出 / tools.exec_command() 嵌套 / 无 console 无网络）都在描述里，截断会导致模型写错代码
             if(!out.tools) out.tools=[];
-            out.tools.push({ type:'function', function:{ name: t.name||('custom_'+((out.tools||[]).length+1)), description: (t.description||'').slice(0,500), parameters: t.input_schema||t.parameters||{ type:'object', properties:{ code:{ type:'string', description:'JavaScript source code to evaluate' } }, required:['code'] } } });
+            out.tools.push({ type:'function', function:{ name: t.name||('custom_'+((out.tools||[]).length+1)), description: t.description||'', parameters: t.input_schema||t.parameters||{ type:'object', properties:{ code:{ type:'string', description:'JavaScript source code to evaluate' } }, required:['code'] } } });
           }
         }
         continue;
