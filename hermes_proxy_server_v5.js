@@ -484,6 +484,19 @@ async function handleResponses( res, authOk, bodyStr ){
         return res.end(()=>{ console.log('[responses] RES_ENDED model='+reqModel+' upstream-fail'); });
       }
       const reader = streamObj.getReader();
+      // 卡死看门狗：上游（CloudBase/hy3）偶发“收了请求但流一直不结束也不报错”，此前会让 codex 无限转圈。
+      // 一旦超过 STALL_MS 没收到任何上游 token（data: 行），主动取消上游并发 response.completed(failed) 让客户端停下/重试。
+      let lastDataTs = Date.now();
+      let stalled = false;
+      const STALL_MS = 150000;
+      const stallWatch = setInterval(()=>{
+        if(stalled) return;
+        if(Date.now() - lastDataTs > STALL_MS){
+          stalled = true;
+          console.error('[responses][stream] STALL abort: no upstream token for '+STALL_MS+'ms; model='+reqModel+' msgs='+((chat.messages||[]).length));
+          try{ reader.cancel(); }catch(_){}
+        }
+      }, 5000);
       (async()=>{
         try{
           while(true){
@@ -498,6 +511,7 @@ async function handleResponses( res, authOk, bodyStr ){
               const d = s.slice(5).trim();
               if(d==='[DONE]') continue;
               let j; try{ j = JSON.parse(d); }catch(e){ continue; }
+              lastDataTs = Date.now();
               const dc = j.choices && j.choices[0] && j.choices[0].delta;
               if(dc && dc.content){ text += dc.content; deltaCount++; push('response.output_text.delta', { item_id:iid, output_index:0, content_index:0, delta: dc.content }); }
               // ---- 工具调用：把上游 chat 格式的 delta.tool_calls 转成 Responses function_call 事件 ----
@@ -527,7 +541,7 @@ async function handleResponses( res, authOk, bodyStr ){
             }
             }
           }
-          clearHb();
+          clearHb(); clearInterval(stallWatch);
           const outText = text || '';
           console.log('[responses] STREAM_DONE model='+reqModel+' completed=1 deltas='+deltaCount+' textLen='+(text?text.length:0)+' tools='+Object.keys(toolCalls).length);
           push('response.output_text.done', { item_id:iid, output_index:0, content_index:0, text: outText });
@@ -553,10 +567,10 @@ async function handleResponses( res, authOk, bodyStr ){
           const outItems = [];
           if(outText) outItems.push({ type:'message', status:'completed', role:'assistant', content:[{type:'output_text', text: outText, annotations:[]}] });
           for(const fi of fcItems) outItems.push(fi);
-          push('response.completed', { response: { id:rid, object:'response', status:'completed', model:reqModel, output: outItems, usage:null } });
-          res.end(()=>{ console.log('[responses] RES_ENDED model='+reqModel+' completed=1'); });
+          push('response.completed', { response: { id:rid, object:'response', status:(stalled?'failed':'completed'), model:reqModel, output: outItems, usage:null, ...(stalled?{error:{message:'upstream stream stalled (no token for '+STALL_MS+'ms)'}}:{}) } });
+          res.end(()=>{ console.log('[responses] RES_ENDED model='+reqModel+' completed='+(stalled?0:1)+(stalled?' STALL':'')); });
         }catch(e){
-          clearHb();
+          clearHb(); clearInterval(stallWatch);
           console.error('[responses][stream] FAIL err='+((e&&e.message)||String(e))+' model='+reqModel);
           if(!res.writableEnded){
             const outText = text || '';
@@ -583,8 +597,8 @@ async function handleResponses( res, authOk, bodyStr ){
             const outItems = [];
             if(outText) outItems.push({ type:'message', status:'completed', role:'assistant', content:[{type:'output_text', text: outText, annotations:[]}] });
             for(const fi of fcItems) outItems.push(fi);
-            push('response.completed', { response: { id:rid, object:'response', status:'completed', model:reqModel, output: outItems, usage:null } });
-            res.end(()=>{ console.log('[responses] RES_ENDED model='+reqModel+' completed=0'); });
+            push('response.completed', { response: { id:rid, object:'response', status:(stalled?'failed':'completed'), model:reqModel, output: outItems, usage:null, ...(stalled?{error:{message:'upstream stream stalled (no token for '+STALL_MS+'ms)'}}:{}) } });
+            res.end(()=>{ console.log('[responses] RES_ENDED model='+reqModel+' completed=0'+(stalled?' STALL':'')); });
           }
         }
       })();
