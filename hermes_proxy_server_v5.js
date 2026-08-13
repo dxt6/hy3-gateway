@@ -46,9 +46,23 @@ function release(){ active--; if(queue.length){ active++; queue.shift()(); } }
 // ---------- 上游调用：SDK 原生 AI 调用（官方允许来源）+ 429 退避重试 ----------
 // 判断是否为可重试的「上游瞬时错误」（网络/网关层 5xx + 上游 JSON-RPC 内部错误）。
 // 注意：不重试 4xx / 参数错误（那是请求本身有问题，重试无用）。
-function isTransientUpstreamError(o){
+// 上游错误：携带真实 HTTP 状态码，让 handler 透传给客户端（而非一律 502）。
+class UpstreamError extends Error {
+  constructor(status, message){ super(message); this.name='UpstreamError'; this.status = status; this.upstream = true; }
+}
+
+// 判断是否为可重试的「上游瞬时错误」。
+// 优先用显式 HTTP 状态码（从异常消息解析，如 "Request failed with status code 400"）做分类，
+// 再回退到关键词启发式。该 CloudBase 后端的 400/5xx 多为瞬时抖动（实测同请求稍后 curl 即 200），
+// 应进重试；而 401/403/404/422 等是鉴权/请求问题，重试无用，原样透传真实状态码。
+function isTransientUpstreamError(o, status){
+  if(typeof status === 'number' && status >= 400){
+    if([500,502,503,504,507,508, 408,409,425,429, 400].includes(status)) return true; // 400 在本后端多为瞬时
+    if([401,403,404,405,410,411,412,413,414,415,416,422,423,424].includes(status)) return false; // 鉴权/定位/参数类不重试
+    return false; // 其他 4xx 默认不重试
+  }
   const s = (typeof o === 'string') ? o : JSON.stringify(o || '');
-  if(/429|rate|limit|quota|过于频繁|超出并发|too many|exceed|502|500|503|504|network error|ECONN|ETIMEDOUT|ECONNRESET|socket hang|bad gateway|gateway timeout|internal error|-32603|-32001/i.test(s)) return true;
+  if(/429|rate|jar|limit|quota|过于频繁|超出并发|too many|exceed|502|500|503|504|network error|ECONN|ETIMEDOUT|ECONNRESET|socket hang|bad gateway|gateway timeout|internal error|-32603|-32001/i.test(s)) return true;
   if(/404|400|401|403|invalid|unsupported|required|too long|bad request/i.test(s)) return false; // 明确的请求/参数错误，不重试
   // 上游 JSON-RPC / OpenAI 错误体里的瞬时类
   const code = (typeof o === 'object' && o) ? (o.code ?? (o.error && o.error.code)) : undefined;
@@ -86,15 +100,19 @@ async function callUpstream(payload, stream){
     }catch(e){
       release();
       const msg = (e && e.message) || String(e);
-      console.log('[hermes][UPSTREAM-EXC] ' + msg.slice(0,200));
-      if(isTransientUpstreamError(msg) && attempt < maxRetries){
+      const m = msg.match(/status code (\d{3})/i);
+      const status = m ? parseInt(m[1],10) : 0;
+      console.log('[hermes][UPSTREAM-EXC] ' + msg.slice(0,200) + (status? ' [http '+status+']':''));
+      if(isTransientUpstreamError(msg, status) && attempt < maxRetries){
         attempt++;
         const backoff = Math.min(1000 * 2 ** attempt, 8000);
-        console.log('[hermes] retry '+attempt+'/'+maxRetries+' after '+backoff+'ms: '+msg.slice(0,120));
+        console.log('[hermes] retry '+attempt+'/'+maxRetries+' (upstream '+(status||'?')+') after '+backoff+'ms');
         await new Promise(r=>setTimeout(r, backoff));
         continue;
       }
-      throw e;
+      // 非瞬时或重试耗尽：把真实上游状态/错误回给客户端，不再包成笼统 502（避免 codex 误判网络错误重试）
+      const outStatus = (status>=400) ? status : 502;
+      throw new UpstreamError(outStatus, msg);
     }
   }
 }
@@ -567,7 +585,8 @@ async function handleResponses( res, authOk, bodyStr ){
       res.end(JSON.stringify(chatToResponses(r, reqModel)));
     }
   }catch(e){
-    if(!res.headersSent){ res.writeHead(502,{'Content-Type':'application/json'}); res.end(JSON.stringify({error:{message:(e&&e.message)||String(e)}})); }
+    const st = (e && e.status) ? e.status : 502;
+    if(!res.headersSent){ res.writeHead(st,{'Content-Type':'application/json'}); res.end(JSON.stringify({error:{message:(e&&e.message)||String(e)}})); }
     else if(!res.writableEnded) res.end();
   }
 }
@@ -652,8 +671,9 @@ if(req.method==='GET' && (url==='/'||url==='/v1'||url==='/health')){ res.writeHe
         }
       }
     }catch(e){
+      const st = (e && e.status) ? e.status : 502;
       if(!res.headersSent){
-        res.writeHead(502,{'Content-Type':'application/json'});
+        res.writeHead(st,{'Content-Type':'application/json'});
         res.end(JSON.stringify({error:{message:(e&&e.message)||String(e)}}));
       } else { try{ res.end(); }catch(_){} }
     }
