@@ -45,3 +45,8 @@ cloudbase-ai/
 # ===== 系统 =====
 .DS_Store
 Thumbs.db
+
+# ===== 本地启动脚本（含凭据，绝不上传） =====
+start_local_gateway.cmd
+start_local_gateway.sh
+.env.local
