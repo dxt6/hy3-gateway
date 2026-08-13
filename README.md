@@ -74,8 +74,9 @@ Claude Code / Claude Desktop / 任意客户端
 6. **429 重试 + 并发控制**：命中 429/rate/limit 指数退避重试 3 次（1s/2s/4s）；并发信号量默认 4，排队不报错。
 7. **count_tokens**：`/v1/messages/count_tokens` 返回估算值（Claude Code 依赖此端点）。
 8. **OpenAI Responses API**：`/responses` 与 `/v1/responses` 兼容 codex 等客户端——`responsesToChat` 把 `input` 转 chat 消息、`chatToResponses` 把上游结果转 Responses 形状、流式用 `callUpstream(chat,true)` 的 reader 包成 Responses SSE 事件；模型统一回落 hy3-preview。
-   - **codex 特殊点（踩坑已修）**：codex 不走顶层 `tools`，而是用 Responses API 的 `additional_tools` 字段带**内置工具**（`{"type":"additional_tools","role":"developer","tools":[{...}]}`），常见一个 `type:"custom"` 的 `exec`（V8 沙箱）。转换规则：`additional_tools` 里的 `function` 工具并入 chat 顶层 `tools`；`custom` 工具**无法在 hy3 上真执行**，降级成一条 system 消息让模型"知道"有它；`role:"developer"` 当 system 处理。`tool_choice` 守卫：**只要有 `tool_choice` 却没有可用 function 工具就删掉 `tool_choice`**，否则上游 chat/completions 报 `tools is required when tool_choice is set` → 502。
-   - 已知限制：codex 的 `exec` 自定义工具在 hy3-preview 下**不能真正调用执行**（上游只认 function 工具），网关目前让它以文本方式"感知"该能力；若 codex 强依赖 exec 结果，会降级为纯文本对话。
+   - **codex 特殊点（踩坑已修）**：codex 不走顶层 `tools`，而是用 Responses API 的 `additional_tools` 字段带**内置工具**（`{"type":"additional_tools","role":"developer","tools":[{...}]}`），常见一个 `type:"custom"` 的 `exec`（V8 沙箱）及 `wait` / `request_user_input` 等 function 工具。转换规则：`additional_tools` 里的 function 工具并入 chat 顶层 `tools`；**custom 工具也暴露为 function 工具**（缺省 schema `{code:string}`，让上游能正式发起 tool_call，网关只转发、执行在客户端）；`role:"developer"` 当 system 处理。`tool_choice` 守卫：**只要有 `tool_choice` 却没有可用 function 工具就删掉 `tool_choice`**，否则上游 chat/completions 报 `tools is required when tool_choice is set` → 502。
+   - **工具调用（实测可用）**：上游 `delta.tool_calls` 流式转发——function 工具发 `function_call` 项（`function_call_arguments.delta/done`），custom 工具（exec）发 **`custom_tool_call` 项**（`custom_tool_call_input.done`，input 为原始 JS，`{code:...}/{string:...}` 单键对象自动解包）；多轮往返支持 `function_call/custom_tool_call` + `function_call_output/custom_tool_call_output`（custom 工具的 input 回传时包成 `{code:...}` 对象，因上游会 `json.loads(arguments).items()`）。本机 codex exec 实测：12*13→156、数组排序求和均正常。
+   - 已知限制：上游模型是 hy3-preview（工具可用性取决于它）；codex 本地若报 `failed to spawn code-mode host`，需把 `AppData\Local\OpenAI\Codex\bin\<hash>\codex-code-mode-host.exe` 复制到 `~/.codex/.sandbox-bin/`。
 
 ---
 
@@ -124,6 +125,7 @@ Claude Code / Claude Desktop / 任意客户端
 | 08-13 07:31 | **断流真因 = 流式事件序列不完整 + 诊断日志被误删** | 抓到 `[responses] IN ... nMsgs=19` 证明 codex 请求**能到达网关**（之前日志全空是因为"还原基线"用的是不含 `[responses] IN/FAIL` 的干净 bak，把诊断日志连带删了）。真因：网关只发 `created/in_progress/delta/completed`，缺 OpenAI Responses 规范必需的 `output_item.added` / `content_part.added` / `content_part.done` / `output_item.done`，codex 严格客户端收裸 delta 找不到 item 上下文即中断。修复：补全完整事件序列；恢复 `[responses] IN` 诊断日志（console.log 确保进 journald）。隧道流式实测事件序列完整 |
 | 08-13 07:45 | **codex 流式断流（最终根因 = prefill 期 idle 超时）** | 前面几轮把"事件序列不完整/上游错误"当根因都修了，仍报 `stream closed before response.completed`。实测定位：`handleResponses` 流式分支先 `await callUpstream(chat,true)`（上游 prefill，**codex 长上下文可达数十秒**）才 `res.writeHead`——prefill 期间客户端**收不到任何字节（无 HTTP 响应头）**，被 Cloudflare/客户端 idle 超时掐断。修复：把 `writeHead` + 即时 `: ping` + 心跳（每 3s 一条 SSE 注释）**整体提前到 `await callUpstream` 之前**，并让心跳常驻整条流（覆盖 prefill 与生成期任何停顿）；另补全规范事件 `response.output_text.done`。经隧道实测：headers 立即发出（response.created 由 3.2s 降到 ~0.9s），`: ping` 每 3s 穿透 Cloudflare 到达客户端，48s 长流完整收到 `response.completed` |
 | 08-13 07:56 | **codex 流式断流（真正最终根因 = 事件 payload 缺 type + response 包装；本机直接调 codex 复现）** | 前一轮修完 prefill 后 codex **仍**报 `stream closed before response.completed`。本机直接跑 codex 0.147 复现：①codex 传输层 **WebSocket 优先**，先 `wss://.../responses` 升级（网关不支持 WS）→ 502×6 → 回退 HTTPS；②回退后网关虽发完 `response.completed`（日志 `STREAM_DONE completed=1`/`RES_ENDED`），codex 却**按 `data.type` 分发事件**——我们所有事件缺顶层 `type` 字段，且 `created/in_progress/completed` 的 payload 未把 response 对象嵌套在 `response` 字段（真实 API 结构），codex 识别不了完成事件，nMsgs 逐次+1 反复重试。修复：`push` 助手自动注入 `type:<事件名>`；三个 response 级事件改为 `{response:{...}}` 嵌套。验证：本机 `codex exec` 经隧道正常返回（`正常` 与斐波那契代码），无断流；配合 `~/.codex/config.toml` 的 `supports_websockets=false` 自定义 provider，WS 502 重试也消失 |
+| 08-13 08:18 | **codex 工具调用打通（exec 真正执行）** | codex 一到工具调用就停的根因（实测三层）：①custom 工具（exec）被降级成 system 消息、未暴露为 function 工具 → hy3 无 exec 可调，只回文本或空白；②流式丢弃 `delta.tool_calls`，上游 tool_call 被吞；③即便转发，custom 工具在 Responses 规范里应产出 `custom_tool_call` 项（input 为原始输入），发 `function_call` 项会报 `tool exec invoked with incompatible payload`。修复：custom 工具暴露为 function 工具；流式转发 tool_calls 并按类型发 function_call / custom_tool_call 事件；custom 参数 `{code:...}/{string:...}` 单键对象解包为原始 JS；多轮往返支持 `*_output` 且 custom input 包 `{code:...}`（上游要 `json.loads(arguments).items()`）。另：本地 `~/.codex/.sandbox-bin` 缺 `codex-code-mode-host.exe`（已从 AppData 复制补齐，否则 exec 报 failed to spawn code-mode host）。本机 codex exec 实测：12*13→156、数组排序求和→[1,2,4,5,8]+20，全链路无 FAIL |
 
 ### 关键经验（踩坑结论）
 - **成长计划 = 必须走 SDK 原生调用**（modelRequest）或带 SDK UA；HTTP 直连/JWT key 直连 = 403。
@@ -152,7 +154,7 @@ Claude Code / Claude Desktop / 任意客户端
 | 卡 1 分钟 | 上下文过大（prefill 随长度线性变慢） | `/compact` 或新开对话。注意：网关**不再**静默截断到 32K（会丢记忆），只在 >250K 时才动 |
 | 模型「忘记」前文 | 旧版网关静默截断上下文到 32K | 已修（`0fb2ece`）：默认全保留，确认 live 的 `HARD_CTX_EST=250000` |
 | 回复吐出来又消失 | SSE 序列不完整 | 已修复 v4.1；确认网关是 v5.3 |
-| 工具调用停 | 转换层缺 tools 支持 | 已修复 v4；确认网关是 v5.3 |
+| 工具调用停 / codex 一到工具调用就停 | ① custom 工具未暴露为 function 工具；② 流式丢弃 tool_calls；③ custom 工具须发 `custom_tool_call` 项而非 `function_call` | 已修复：exec 等 custom 工具暴露 + 流式转发 + 按类型发事件 + 多轮往返（详见历史 08-13 08:18 行） |
 | 401 | token 不匹配 | 检查客户端 API Key = CB_PROXY_AUTH 值 |
 | 502 | **先看日志里的耗时，能直接区分根因**（`journalctl -u hermes-proxy \| grep 502`） | 见下两行 |
 | └ 502 耗时 <1s（如 340ms） | 上游**立即拒绝**：模型名不被 CloudBase 接受（未映射就透传）、请求体畸形 | 确认 `model: MODEL_MAP[b.model] \|\| 'hy3-preview'`（**不要**带 `\|\| b.model`，否则未登记名会透传被拒） |
