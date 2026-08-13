@@ -44,6 +44,20 @@ function acquire(){ return new Promise(r=>{ if(active<MAX_CONCURRENCY){ active++
 function release(){ active--; if(queue.length){ active++; queue.shift()(); } }
 
 // ---------- 上游调用：SDK 原生 AI 调用（官方允许来源）+ 429 退避重试 ----------
+// 判断是否为可重试的「上游瞬时错误」（网络/网关层 5xx + 上游 JSON-RPC 内部错误）。
+// 注意：不重试 4xx / 参数错误（那是请求本身有问题，重试无用）。
+function isTransientUpstreamError(o){
+  const s = (typeof o === 'string') ? o : JSON.stringify(o || '');
+  if(/429|rate|limit|quota|过于频繁|超出并发|too many|exceed|502|500|503|504|network error|ECONN|ETIMEDOUT|ECONNRESET|socket hang|bad gateway|gateway timeout|internal error|-32603|-32001/i.test(s)) return true;
+  if(/404|400|401|403|invalid|unsupported|required|too long|bad request/i.test(s)) return false; // 明确的请求/参数错误，不重试
+  // 上游 JSON-RPC / OpenAI 错误体里的瞬时类
+  const code = (typeof o === 'object' && o) ? (o.code ?? (o.error && o.error.code)) : undefined;
+  const cat = (typeof o === 'object' && o) ? ((o.category) || (o.error && o.error.category) || (o.data && o.data.category)) : undefined;
+  if(code === -32603 || code === -32001 || code === -32000) return true; // 上游内部/网络错误
+  if(cat === 'internal' || cat === 'network' || cat === 'rate_limit') return true;
+  return false;
+}
+
 async function callUpstream(payload, stream){
   const maxRetries = 3;
   let attempt = 0;
@@ -54,12 +68,26 @@ async function callUpstream(payload, stream){
       const ai = app.ai();
       const res = await ai.modelRequest({ url: GATEWAY, data: payload, stream: !!stream, timeout: 280000 });
       release();
+      // 上游有时返回 HTTP 200 + 错误体（如 JSON-RPC {code:-32603,message:"Internal error"}），
+      // 这种不算成功，需当作失败重试；但明确的请求/参数错误则原样透传给客户端。
+      if(res && (res.error || (typeof res.code === 'number' && res.code < 0))){
+        const errStr = JSON.stringify(res).slice(0,200);
+        console.log('[hermes][UPSTREAM-ERR] ' + errStr);
+        if(isTransientUpstreamError(res) && attempt < maxRetries){
+          attempt++;
+          const backoff = Math.min(1000 * 2 ** attempt, 8000);
+          console.log('[hermes] retry '+attempt+'/'+maxRetries+' (upstream error body) after '+backoff+'ms');
+          await new Promise(r=>setTimeout(r, backoff));
+          continue;
+        }
+        return res; // 不可重试的错误体：原样透传，由客户端（codex）展示
+      }
       return res;
     }catch(e){
       release();
       const msg = (e && e.message) || String(e);
-      const isRetry = /429|rate|limit|quota|过于频繁|超出并发|too many|exceed/i.test(msg);
-      if(isRetry && attempt < maxRetries){
+      console.log('[hermes][UPSTREAM-EXC] ' + msg.slice(0,200));
+      if(isTransientUpstreamError(msg) && attempt < maxRetries){
         attempt++;
         const backoff = Math.min(1000 * 2 ** attempt, 8000);
         console.log('[hermes] retry '+attempt+'/'+maxRetries+' after '+backoff+'ms: '+msg.slice(0,120));
