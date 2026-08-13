@@ -13,18 +13,18 @@ const PORT = 8787;
 const MAX_CONCURRENCY = parseInt(process.env.MAX_CONCURRENCY || '4', 10);
 const GATEWAY = 'https://' + ENV_ID + '.api.tcloudbasegateway.com/v1/ai/cloudbase/chat/completions';
 
-// CloudBase 成长计划只认内置模型；把常见 Claude/OpenAI 模型名映射到 hy3-preview（用户指定，开启 hy3-preview 提速）
+// CloudBase 成长计划只认内置模型；把常见 Claude/OpenAI 模型名映射到 hy3（用户指定改用 hy3）
 const MODEL_MAP = {
-  'claude-haiku-4-5':'hy3-preview','claude-sonnet-4-5':'hy3-preview','claude-opus-4-1':'hy3-preview',
-  'claude-3-5-sonnet':'hy3-preview','claude-3-5-haiku':'hy3-preview','claude-3-sonnet':'hy3-preview',
-  'claude-3-haiku':'hy3-preview','claude-3-opus':'hy3-preview','claude-2.1':'hy3-preview','claude-2.0':'hy3-preview',
-  'claude-instant-1.2':'hy3-preview','claude-instant-1':'hy3-preview',
-  'gpt-4o':'hy3-preview','gpt-4o-mini':'hy3-preview','gpt-4-turbo':'hy3-preview','gpt-4':'hy3-preview','gpt-3.5-turbo':'hy3-preview',
-  'deepseek-chat':'hy3-preview','deepseek-reasoner':'hy3-preview',
-  'qwen-plus':'hy3-preview','qwen-turbo':'hy3-preview','qwen-max':'hy3-preview',
-  'glm-4':'hy3-preview','glm-4-plus':'hy3-preview','kimi':'hy3-preview','moonshot-v1-8k':'hy3-preview'
+  'claude-haiku-4-5':'hy3','claude-sonnet-4-5':'hy3','claude-opus-4-1':'hy3',
+  'claude-3-5-sonnet':'hy3','claude-3-5-haiku':'hy3','claude-3-sonnet':'hy3',
+  'claude-3-haiku':'hy3','claude-3-opus':'hy3','claude-2.1':'hy3','claude-2.0':'hy3',
+  'claude-instant-1.2':'hy3','claude-instant-1':'hy3',
+  'gpt-4o':'hy3','gpt-4o-mini':'hy3','gpt-4-turbo':'hy3','gpt-4':'hy3','gpt-3.5-turbo':'hy3',
+  'deepseek-chat':'hy3','deepseek-reasoner':'hy3',
+  'qwen-plus':'hy3','qwen-turbo':'hy3','qwen-max':'hy3',
+  'glm-4':'hy3','glm-4-plus':'hy3','kimi':'hy3','moonshot-v1-8k':'hy3'
 };
-const BASE_MODELS = ['hy3-preview','deepseek-v4-flash','qwen3.5-flash','glm-5.2','kimi-k2.6','minimax-m3'];
+const BASE_MODELS = ['hy3','deepseek-v4-flash','qwen3.5-flash','glm-5.2','kimi-k2.6','minimax-m3'];
 
 function buildModels(){
   const set = new Set(BASE_MODELS.concat(Object.keys(MODEL_MAP)));
@@ -154,7 +154,7 @@ function anthToOpenAIMessages(msgs){
   return out;
 }
 function anthropicToOpenAI(p){
-  const out = { model: MODEL_MAP[p.model]||p.model||'hy3-preview', max_tokens: p.max_tokens||1024 };
+  const out = { model: MODEL_MAP[p.model]||p.model||'hy3', max_tokens: p.max_tokens||1024 };
   out.messages = anthToOpenAIMessages(p.messages);
   if(Array.isArray(p.tools) && p.tools.length){
     out.tools = p.tools.map(t=>({ type:'function', function:{ name: t.name||'', description: t.description||'', parameters: t.input_schema||{type:'object',properties:{}} } }));
@@ -305,7 +305,7 @@ function extractJSONBody(s){
 function responsesToChat( body ){
   const b = body || {};
   const out = {
-    model: MODEL_MAP[b.model] || 'hy3-preview',
+    model: MODEL_MAP[b.model] || 'hy3',
     messages: [],
     stream: !!b.stream
   };
@@ -699,7 +699,7 @@ if(req.method==='GET' && (url==='/'||url==='/v1'||url==='/health')){ res.writeHe
         return res.end(JSON.stringify({input_tokens: ct||1}));
       }
       const isAnthropic = (url==='/v1/messages');
-      const reqModel = payload.model || 'hy3-preview';
+      const reqModel = payload.model || 'hy3';
       if(isAnthropic){ payload = anthropicToOpenAI(payload); }
       else if(payload.model && MODEL_MAP[payload.model]){ payload.model = MODEL_MAP[payload.model]; }
       const stream = !!payload.stream;

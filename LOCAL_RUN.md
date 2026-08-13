@@ -60,7 +60,9 @@ curl -H "Authorization: Bearer $TOKEN" -X POST http://127.0.0.1:8787/v1/messages
 ```
 
 ## 6. 模型名映射
-网关把常见 Claude / GPT / DeepSeek / 通义 / GLM / Kimi 等模型名统一映射到 CloudBase 内置的 `hy3-preview`（成长计划只认内置模型）。即客户端照常说 `claude-sonnet-4-5`、`gpt-4o` 等，网关自动转。
+网关把常见 Claude / GPT / DeepSeek / 通义 / GLM / Kimi 等模型名统一映射到 CloudBase 内置的 `hy3`（成长计划只认内置模型）。即客户端照常说 `claude-sonnet-4-5`、`gpt-4o` 等，网关自动转。
+
+> 当前上游模型为 `hy3`（2026-08-13 由 `hy3-preview` 改为 `hy3`，见 `hermes_proxy_server_v5.js` 第 17–27、157 行）。`/models` 返回列表首项即 `hy3`。若上游某环境无 `hy3` 只有 `hy3-preview`，把映射值改回 `hy3-preview` 即可。
 
 ## 7. 安全
 - 真实凭据只在 `.env.local` 与 `start_local_gateway.cmd` / `.sh` 中，这两个文件名已在 `.gitignore`，**绝不提交**。
