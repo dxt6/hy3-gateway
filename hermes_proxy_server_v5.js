@@ -154,6 +154,55 @@ function anthImageToOpenAI(b){
   return null;
 }
 
+// ---------- 电脑操控图片注入：工具输出里带 [IMG]路径[/IMG] 标记 → 读图转 image_url 塞回对话 ----------
+// codex 的工具结果通道是文本，模型"看不到"截图；约定工具输出 `[IMG]C:/path.png[/IMG]`，
+// 网关检测到就读文件、转 base64 data URL、以 user 消息（text + image_url）形式追加到 messages，
+// 视觉模型即可真正"看见"屏幕。配合 C:/Temp/tools/screenshot.ps1 / mouse.ps1 使用。
+const IMG_TAG_RE = /\[IMG\]([^\]]+)\[\/IMG\]/;
+function injectImageFromTool(messages, toolOutput){
+  const m = IMG_TAG_RE.exec(toolOutput || '');
+  if(!m) return;
+  const p = m[1].trim();
+  let data;
+  try{ data = fs.readFileSync(p); }catch(e){ return; } // 文件不可读（不存在/权限）则跳过，不影响原流程
+  if(!data || !data.length) return;
+  const ext = (p.split('.').pop()||'').toLowerCase();
+  const mime = (ext==='jpg'||ext==='jpeg') ? 'image/jpeg' : (ext==='gif' ? 'image/gif' : (ext==='webp' ? 'image/webp' : (ext==='bmp' ? 'image/bmp' : 'image/png')));
+  const url = 'data:'+mime+';base64,'+data.toString('base64');
+  messages.push({ role:'user', content:[
+    { type:'text', text:'[系统截图 '+p+'（'+data.length+' bytes），请分析截图内容，需要操作时用截图/鼠标脚本并输出新的 [IMG] 标记]' },
+    { type:'image_url', image_url:{ url } }
+  ]});
+  console.log('[vision][IMG] injected '+p+' ('+data.length+' bytes) into context');
+}
+// 视觉请求时注入电脑操控工具说明（仅当头部还没有时），让视觉模型知道本机有截图/鼠标脚本可用
+const TOOLS_GUIDE = '[本机工具] 你具备电脑屏幕操控能力（Windows 本机），通过 exec 工具执行以下命令：\n' +
+  '1. 截屏: exec_command("powershell -NoProfile -ExecutionPolicy Bypass -File C:/Temp/tools/screenshot.ps1")，输出会带 [IMG]路径[/IMG] 标记，网关会自动把截图以图片形式给你。\n' +
+  '2. 鼠标: exec_command("powershell -NoProfile -ExecutionPolicy Bypass -File C:/Temp/tools/mouse.ps1 <action> <args>")，action 支持: move x y / click x y / rightclick x y / doubleclick x y / drag x1 y1 x2 y2 / scroll lines(正上负下) / type "文本" / key Enter 等。\n' +
+  '3. 流程: 先截屏看图 → 根据截图坐标决定鼠标操作 → 操作后再截屏确认效果。屏幕坐标系与截图像素一致。';
+function injectToolsGuide(messages){
+  if(!Array.isArray(messages) || !messages.length) return;
+  for(const m of messages){ if(m && m.role==='system' && m.content && String(m.content).includes('[本机工具]')) return; }
+  messages.unshift({ role:'system', content: TOOLS_GUIDE });
+}
+
+// 合并相邻 user 消息：注入的图片 user 消息后面若紧跟纯文本 user 消息（如 codex 多轮追问），
+// 合并为一条 content 数组（text + image_url）——部分上游（如智谱）对连续 user 消息只保留最后一条，会丢图片。
+function mergeAdjacentUserImages(messages){
+  for(let i=0; i < messages.length - 1; i++){
+    const a = messages[i], b = messages[i+1];
+    if(!a || !b || a.role!=='user' || b.role!=='user') continue;
+    if(!Array.isArray(a.content) || typeof b.content !== 'string') continue;
+    const hasImg = a.content.some(x=>x && x.type==='image_url');
+    if(!hasImg) continue;
+    const textBlock = a.content.find(x=>x && x.type==='text');
+    if(textBlock) textBlock.text = (textBlock.text||'') + (b.content ? '\n'+b.content : '');
+    else a.content.unshift({ type:'text', text: b.content });
+    messages.splice(i+1, 1);
+    i--; // 继续检查新的相邻
+  }
+}
+
 // ---------- 视觉上游调用：HTTP 直连 OpenAI 兼容 API（智谱 GLM-4V-Flash 等） ----------
 // 与 CloudBase 的 callUpstream 返回形态完全一致：非流式返回 JSON、流式返回带 getReader() 的流，
 // 因此上层所有 SSE→Responses/Anthropic 转换代码无需任何改动即可复用。
@@ -229,6 +278,7 @@ async function callVisionWithRetry(payload, stream){
 async function callUpstreamSmart(payload, stream){
   if(payload && payload.__vision && VISION_API_KEY){
     payload.model = VISION_MODEL; // 视觉请求强制使用视觉模型名
+    injectToolsGuide(payload.messages); // 注入电脑操控工具说明（截图/鼠标脚本用法）
     console.log('[vision] ROUTE model='+VISION_MODEL+' stream='+!!stream+' msgs='+(payload.messages||[]).length);
     return callVisionWithRetry(payload, stream);
   }
@@ -268,6 +318,7 @@ function anthToOpenAIMessages(msgs){
           let rc = r.content;
           if(Array.isArray(rc)) rc = rc.map(b=>b.text||b.content||'').join('');
           out.push({ role:'tool', tool_call_id: anthToolId(r.tool_use_id), content: String(rc||'') });
+          injectImageFromTool(out, String(rc||'')); // [IMG]标记 → 注入截图给视觉模型看
         }
       }
     } else {
@@ -288,6 +339,7 @@ function anthropicToOpenAI(p){
   if(p.top_p!==undefined) out.top_p = p.top_p;
   // 上下文保护: 估算 token 超限则从头部成对截断 + 压缩超大 tool_result
   trimContext(out);
+  mergeAdjacentUserImages(out.messages); // 图片 user 消息与后续文本 user 消息合并（防上游丢图）
   out.__vision = hasVision(out.messages); // 视觉标记：含图片 → callUpstreamSmart 路由到视觉上游
   return out;
 }
@@ -494,6 +546,7 @@ function responsesToChat( body ){
       if(it.type==='function_call_output' || it.type==='custom_tool_call_output'){
         const c = typeof it.output==='string' ? it.output : JSON.stringify(it.output||'');
         out.messages.push({ role:'tool', tool_call_id: it.call_id||'', content: c });
+        injectImageFromTool(out.messages, c); // [IMG]标记 → 注入截图给视觉模型看
         continue;
       }
       let role = (it.role==='system'||it.role==='developer')?'system':((it.role==='assistant')?'assistant':'user');
@@ -531,6 +584,7 @@ function responsesToChat( body ){
     else delete out.tool_choice;
   }
   trimContext(out);
+  mergeAdjacentUserImages(out.messages); // 图片 user 消息与后续文本 user 消息合并（防上游丢图）
   out.__vision = hasVision(out.messages); // 视觉标记：含图片 → callUpstreamSmart 路由到视觉上游
   return out;
 }
