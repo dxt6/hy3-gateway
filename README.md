@@ -48,16 +48,18 @@ API Key:  <CB_PROXY_AUTH 的值>
 
 ```
 Claude Code / Claude Desktop / 任意客户端
-        │  Anthropic /v1/messages 或 OpenAI /v1/chat/completions（流式+非流式）
+        │  Anthropic /v1/messages 或 OpenAI /v1/chat/completions
         ▼
 ┌──────────────────────── 网关 hermes_proxy (v5.3) ────────────────────────┐
-│ 鉴权(token) → 模型映射(→hy3-preview) → 协议转换(Anthropic↔OpenAI)        │
+│ 鉴权(token) → 模型映射(→hy3) → 协议转换(Anthropic↔OpenAI)                │
 │ 上下文保护(默认全保留/250K安全阀) → 429退避重试(3次) → 并发信号量(默认4)  │
 │ 工具调用(tool_use↔tool_calls) / count_tokens / 流式SSE双向转换           │
+│ ★视觉分流：检测到图片(image_url) → 路由 VISION_BASE_URL（智谱 GLM-4V-Flash）│
 └──────────────┬───────────────────────────────────────────────────────────┘
-               │ @cloudbase/node-sdk app.ai().modelRequest()（SDK 原生调用）
+               │ 纯文本请求：@cloudbase/node-sdk app.ai().modelRequest()
+               │ 带图请求：HTTP 直连 OpenAI 兼容视觉 API（默认智谱）
                ▼
-        CloudBase AI 网关（hy3-preview，扣成长计划免费额度）
+        CloudBase AI 网关（hy3，扣成长计划免费额度）    +   视觉 API（GLM-4V-Flash，免费档）
 ```
 
 另一套独立功能：`relay.js`（本地多代理 key 中继，127.0.0.1:58046，给多个本地 agent 分配独立 key 做并发隔离，详见 §六）。
@@ -73,7 +75,8 @@ Claude Code / Claude Desktop / 任意客户端
 5. **上下文保护（已改为保守策略，勿退回旧版）**：`trimContext` 默认**完全不动 messages，上下文 100% 保留**；仅两层防护——① 单条 `tool_result` 超 `SINGLE_TOOL_MAX=32000` 字符时截断该条；② 估算 token（字符/3）超 `HARD_CTX_EST=250000` 才从头部成对删除最旧轮次并打 `[hermes][WARN] context OVERSAFE-TRIM` 日志。旧版本曾静默截断到 32K 导致「模型忘记前文」，已废弃。
 6. **上游瞬时错误重试 + 并发控制**：命中可重试的瞬时错误（429/限流，**以及**上游 5xx、502/500/503/504、`network` 类、JSON-RPC `code:-32603/-32001` 内部/网络错误、`category:internal/network`）指数退避重试 3 次（1s/2s/4s）；**上游即便返回 HTTP 200 + 错误体（如 `{code:-32603,message:"Internal error"}`）也会当作失败重试**；明确的请求/参数错误（4xx、invalid、too long）不重试；但**该后端偶发 `400`（`Request failed with status code 400`）多为瞬时抖动，现归类为可重试**（实测同请求稍后 curl 即 200，日志曾见 1 秒内 12 个 400→502 的瞬时窗口）；重试耗尽或确属真错误时，网关抛出 `UpstreamError(真实状态码)` 透传**真实 HTTP 状态**而非一律 502，避免 codex 误判网络错误触发重试风暴。重试前后打印 `[hermes][UPSTREAM-ERR]/[UPSTREAM-EXC]` 日志，便于直接定位上游真因。并发信号量默认 4，排队不报错。
 7. **count_tokens**：`/v1/messages/count_tokens` 返回估算值（Claude Code 依赖此端点）。
-8. **OpenAI Responses API**：`/responses` 与 `/v1/responses` 兼容 codex 等客户端——`responsesToChat` 把 `input` 转 chat 消息、`chatToResponses` 把上游结果转 Responses 形状、流式用 `callUpstream(chat,true)` 的 reader 包成 Responses SSE 事件；模型统一回落 hy3-preview。
+8. **OpenAI Responses API**：`/responses` 与 `/v1/responses` 兼容 codex 等客户端——`responsesToChat` 把 `input` 转 chat 消息、`chatToResponses` 把上游结果转 Responses 形状、流式用 `callUpstream(chat,true)` 的 reader 包成 Responses SSE 事件；模型统一回落 hy3。
+9. **视觉能力（Vision，2026-08-15 新增）**：配置 `VISION_API_KEY`（默认接智谱 GLM-4V-Flash 免费档）后，带图片的请求自动路由到视觉上游。覆盖三条路径：`/responses`（codex 的 `input_image`，含**顶层** `{"type":"input_image","image_url":...}` 结构——原实现只认 content 数组内的图片，已补）、`/v1/messages`（Anthropic `image` 块 base64/url 两种 source 都转）、`/v1/chat/completions`（原生 `image_url`）。纯文本请求 100% 仍走 CloudBase hy3，不消耗额外额度；不配 key 则视觉完全关闭。视觉上游用 HTTP 直连 + 简单重试（瞬时 5xx 退避 2 次），返回形态与 hy3 一致，SSE→Responses/Anthropic 转换代码零改动。自测脚本 `test_vision_mock.js`（本地 mock OpenAI 兼容端点）。
    - **codex 特殊点（踩坑已修）**：codex 不走顶层 `tools`，而是用 Responses API 的 `additional_tools` 字段带**内置工具**（`{"type":"additional_tools","role":"developer","tools":[{...}]}`），常见一个 `type:"custom"` 的 `exec`（V8 沙箱）及 `wait` / `request_user_input` 等 function 工具。转换规则：`additional_tools` 里的 function 工具并入 chat 顶层 `tools`；**custom 工具也暴露为 function 工具**（缺省 schema `{code:string}`，让上游能正式发起 tool_call，网关只转发、执行在客户端）；`role:"developer"` 当 system 处理。`tool_choice` 守卫：**只要有 `tool_choice` 却没有可用 function 工具就删掉 `tool_choice`**，否则上游 chat/completions 报 `tools is required when tool_choice is set` → 502。
    - **工具调用（实测可用）**：上游 `delta.tool_calls` 流式转发——function 工具发 `function_call` 项（`function_call_arguments.delta/done`），custom 工具（exec）发 **`custom_tool_call` 项**（`custom_tool_call_input.done`，input 为原始 JS，`{code:...}/{string:...}` 单键对象自动解包）；多轮往返支持 `function_call/custom_tool_call` + `function_call_output/custom_tool_call_output`（custom 工具的 input 回传时包成 `{code:...}` 对象，因上游会 `json.loads(arguments).items()`）。本机 codex exec 实测：12*13→156、数组排序求和、**curl.exe 抓取 example.com 标题、创建/读取文件**均正常。
    - **坑：custom 工具 description 必须完整透传**（不要截断）——exec 的正确用法（`text()` 输出、`tools.exec_command()` 嵌套、隔离区无 console/无网络、Windows 用 `curl.exe` 而非 PowerShell 的 `curl` 别名）全在描述里，截断会让上游写错代码（`import()`/`console.log`）导致工具静默失败。
@@ -132,6 +135,7 @@ Claude Code / Claude Desktop / 任意客户端
 | 08-13 15:18 | **codex 又报 `wss://.../responses` 502（WS 重试风暴复发）** | 根因：`config.toml` 第6行 `model_provider` 被改回内置 `openai`（用户桌面端切过模型/provider 或还原备份），`openai_http`(HTTP-only) 段虽在但未生效 → codex 仍 WS 优先 → Cloudflare 隧道 502。修复：第6行改回 `openai_http` 使其顶层生效；并用真实桌面 codex(`AppData\Local\OpenAI\Codex\bin\8e8bf206e63ac436\codex.exe`) 实跑验证全程无 websocket/Reconnecting/wss 日志。经验：**每次在 GUI 切模型/provider 后要回查第6行仍是 `openai_http`**，否则 WS 502 复发 |
 | 08-13 15:24 | **网关侧加 WebSocket 升级 426 守卫（双保险）** | 即便 `model_provider` 又被改回 `openai`，codex 发 `wss://.../responses` 也会被网关 `handle` 直接 426（不再卡 5 次~15s 重试风暴、不再被 CF 502）。`handle` 顶部检测 `Connection: Upgrade` → 426 + `req.resume()`。部署后实测：WS 升级返回 `426`（原 502）、HTTPS `/v1/responses` 仍 `200`。`IDENTICAL_TO_LIVE`(md5 55389db3)。注：用户已切到 WorkBuddy 官方服务，此改动为将来复用我们的网关时兜底 |
 | 08-13 16:22 | **502 真因修复：上游瞬时 400 进重试 + 真实状态码透传** | 日志 15:17 抓到 `GET /responses -> 502` 且伴随 `[hermes][UPSTREAM-EXC] Request failed with status code 400`——根因是 CloudBase 上游偶发 400（实测为瞬时抖动，同请求稍后 curl 即 200），但原 `isTransientUpstreamError` 把 400 判为不可重试 → `throw` → handler 统一包成 502 丢回 codex，codex 误判网络错误触发重试风暴（1 秒 12 个 502）。修复：`isTransientUpstreamError` 改为按显式 HTTP 状态码分类（400/408/409/425/429/5xx 瞬时可重试；401/403/404/422 不重试）；`callUpstream` 解析 `status code NNN` 重试 3 次（退避封顶 8s），耗尽/确属真错误时抛 `UpstreamError(真实状态码)` 由 handler 透传真实状态；两处 handler catch 用 `e.status`。部署 md5 74aba007，冒烟 200。commit af29728 |
+| 08-15 01:00 | **视觉能力（Vision）接入** | codex/Claude Code 带图请求自动路由智谱 GLM-4V-Flash（免费）。新增：`VISION_*` 配置、`hasVision` 图片检测、`callVisionUpstream`（HTTP 直连 OpenAI 兼容 API + 重试）、`callUpstreamSmart` 智能分流；**修复 codex 顶层 `input_image` 被静默丢弃的 bug**（原 `responsesToChat` 只认 content 数组内图片）；Anthropic `image` 块（base64/url）转 `image_url`。三条路径（/responses、/v1/messages、/v1/chat/completions）全覆盖，流式/非流式均可。纯文本仍 100% 走 hy3。本地 mock 冒烟：带图路由 ✓ / Anthropic 图片块 ✓ / 流式 ✓ / 纯文本不误路由 ✓ |
 
 ### 关键经验（踩坑结论）
 - **成长计划 = 必须走 SDK 原生调用**（modelRequest）或带 SDK UA；HTTP 直连/JWT key 直连 = 403。

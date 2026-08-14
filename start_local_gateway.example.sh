@@ -18,6 +18,10 @@ set +a
 
 export LISTEN="${LISTEN:-127.0.0.1}"
 export MAX_CONCURRENCY="${MAX_CONCURRENCY:-4}"
+# 视觉能力（可选）：填了 VISION_API_KEY 后，带图片的请求自动走智谱 GLM-4V-Flash；不填则纯 hy3
+export VISION_API_KEY="${VISION_API_KEY:-}"
+export VISION_BASE_URL="${VISION_BASE_URL:-https://open.bigmodel.cn/api/paas/v4/chat/completions}"
+export VISION_MODEL="${VISION_MODEL:-glm-4v-flash}"
 
 NODE="${NODE:-node}"
 exec "$NODE" "$(dirname "$0")/hermes_proxy_server_v5.js"

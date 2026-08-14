@@ -2,6 +2,7 @@ const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const zlib = require('zlib');
+const { Readable } = require('stream');
 const tcb = require('@cloudbase/node-sdk');
 const WebSocket = require('ws');
 
@@ -12,6 +13,13 @@ const AUTH_TOKEN = process.env.CB_PROXY_AUTH || '';
 const PORT = 8787;
 const MAX_CONCURRENCY = parseInt(process.env.MAX_CONCURRENCY || '4', 10);
 const GATEWAY = 'https://' + ENV_ID + '.api.tcloudbasegateway.com/v1/ai/cloudbase/chat/completions';
+
+// ---------- 视觉能力（Vision）配置：请求带图片时路由到支持视觉的 OpenAI 兼容 API ----------
+// 检测到消息含 image_url 内容块 → 自动改走 VISION_BASE_URL（默认智谱 GLM-4V-Flash，免费）；
+// 纯文本请求 100% 继续走 CloudBase hy3（不消耗额外额度）。不配 VISION_API_KEY 则视觉路由自动关闭。
+const VISION_BASE_URL = process.env.VISION_BASE_URL || 'https://open.bigmodel.cn/api/paas/v4/chat/completions';
+const VISION_API_KEY = process.env.VISION_API_KEY || '';
+const VISION_MODEL = process.env.VISION_MODEL || 'glm-4v-flash';
 
 // CloudBase 成长计划只认内置模型；把常见 Claude/OpenAI 模型名映射到 hy3（用户指定改用 hy3）
 const MODEL_MAP = {
@@ -28,6 +36,7 @@ const BASE_MODELS = ['hy3','deepseek-v4-flash','qwen3.5-flash','glm-5.2','kimi-k
 
 function buildModels(){
   const set = new Set(BASE_MODELS.concat(Object.keys(MODEL_MAP)));
+  if(VISION_API_KEY && VISION_MODEL) set.add(VISION_MODEL); // 视觉模型仅在配了 key 时暴露
   return {object:'list',data:[...set].map(id=>({id,object:'model',created:0,owned_by:'cloudbase'}))};
 }
 function mapStop(fr){
@@ -120,7 +129,113 @@ async function callUpstream(payload, stream){
   }
 }
 
-// ---------- 请求转换: Anthropic -> OpenAI ----------
+// ---------- 视觉路由：检测消息里是否含图片（image_url 内容块） ----------
+// 所有输入（Responses input_image / Anthropic image 块 / 原生 OpenAI image_url）转换后统一
+// 变成 OpenAI 的 {type:'image_url'} 块，检测这个即可。返回 true 表示该请求需要视觉模型。
+function hasVision(messages){
+  for(const m of messages||[]){
+    const c = m && m.content;
+    if(Array.isArray(c)){
+      for(const b of c){ if(b && b.type==='image_url') return true; }
+    }
+  }
+  return false;
+}
+// Anthropic image 块 → OpenAI image_url 块（base64 或 url 两种 source 都支持）
+function anthImageToOpenAI(b){
+  const src = b && b.source;
+  if(!src) return null;
+  if(src.type==='base64' && src.data){
+    return { type:'image_url', image_url:{ url: 'data:'+(src.media_type||'image/png')+';base64,'+src.data } };
+  }
+  if(src.type==='url' && src.url){
+    return { type:'image_url', image_url:{ url: src.url } };
+  }
+  return null;
+}
+
+// ---------- 视觉上游调用：HTTP 直连 OpenAI 兼容 API（智谱 GLM-4V-Flash 等） ----------
+// 与 CloudBase 的 callUpstream 返回形态完全一致：非流式返回 JSON、流式返回带 getReader() 的流，
+// 因此上层所有 SSE→Responses/Anthropic 转换代码无需任何改动即可复用。
+function callVisionUpstream(payload, stream){
+  return new Promise((resolve, reject)=>{
+    let u;
+    try{ u = new URL(VISION_BASE_URL); }
+    catch(e){ return reject(new UpstreamError(502, 'bad VISION_BASE_URL: '+VISION_BASE_URL)); }
+    const body = JSON.stringify(payload);
+    const mod = u.protocol==='http:' ? http : https;
+    const req = mod.request({
+      hostname: u.hostname,
+      port: u.port || (u.protocol==='https:' ? 443 : 80),
+      path: u.pathname + u.search,
+      method: 'POST',
+      headers: {
+        'Content-Type':'application/json',
+        'Authorization':'Bearer ' + VISION_API_KEY,
+        'Content-Length': Buffer.byteLength(body),
+        'User-Agent':'hermes-proxy-v5/vision',
+        'Accept':'text/event-stream'
+      },
+      timeout: 280000
+    }, (up)=>{
+      if(stream){
+        if(up.statusCode !== 200){
+          let errBuf='';
+          up.on('data', c=>errBuf+=c);
+          up.on('end', ()=>reject(new UpstreamError(up.statusCode||502, 'vision upstream HTTP '+up.statusCode+': '+errBuf.slice(0,200))));
+          return;
+        }
+        resolve(Readable.toWeb(up)); // web ReadableStream，兼容现有 getReader() 用法
+      } else {
+        let buf='';
+        up.on('data', c=>buf+=c);
+        up.on('end', ()=>{
+          if(up.statusCode !== 200){
+            return reject(new UpstreamError(up.statusCode||502, 'vision upstream HTTP '+up.statusCode+': '+buf.slice(0,200)));
+          }
+          try{ resolve(JSON.parse(buf)); }
+          catch(e){ reject(new Error('vision upstream bad json: '+buf.slice(0,200))); }
+        });
+      }
+    });
+    req.on('error', e=>reject(new UpstreamError(502, 'vision upstream error: '+e.message)));
+    req.on('timeout', ()=>{ req.destroy(new Error('vision upstream timeout')); });
+    req.write(body); req.end();
+  });
+}
+// 视觉上游简单重试（瞬时 5xx/超时/429 退避 1s/2s；参数类 4xx 不重试）
+async function callVisionWithRetry(payload, stream){
+  const maxRetries = 2;
+  let attempt = 0;
+  while(true){
+    try{
+      return await callVisionUpstream(payload, stream);
+    }catch(e){
+      const st = (e && e.status) ? e.status : 0;
+      const transient = st===0 || [500,502,503,504,507,508,408,409,425,429].includes(st);
+      if(transient && attempt < maxRetries){
+        attempt++;
+        const backoff = 1000 * attempt;
+        console.log('[vision] retry '+attempt+'/'+maxRetries+' (http '+(st||'?')+') after '+backoff+'ms');
+        await new Promise(r=>setTimeout(r, backoff));
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+
+// ---------- 智能上游分发：带图片 → 视觉 API；纯文本 → CloudBase hy3 ----------
+async function callUpstreamSmart(payload, stream){
+  if(payload && payload.__vision && VISION_API_KEY){
+    payload.model = VISION_MODEL; // 视觉请求强制使用视觉模型名
+    console.log('[vision] ROUTE model='+VISION_MODEL+' stream='+!!stream+' msgs='+(payload.messages||[]).length);
+    return callVisionWithRetry(payload, stream);
+  }
+  return callUpstream(payload, stream);
+}
+
+
 function anthToOpenAIMessages(msgs){
   const out = [];
   for(const m of msgs||[]){
@@ -140,7 +255,15 @@ function anthToOpenAIMessages(msgs){
       } else {
         const text = content.filter(b=>b.type==='text').map(b=>b.text||'').join('');
         const results = content.filter(b=>b.type==='tool_result');
-        if(text) out.push({ role:'user', content: text });
+        const images = content.filter(b=>b.type==='image').map(anthImageToOpenAI).filter(Boolean);
+        if(text || images.length){
+          // 有图片时 content 必须是数组（text + image_url 混合）；纯文本保持字符串形态（避免改变非视觉请求行为）
+          const cm = [];
+          if(text) cm.push({ type:'text', text });
+          for(const img of images) cm.push(img);
+          const onlyText = cm.length===1 && cm[0].type==='text';
+          out.push({ role:'user', content: onlyText ? text : cm });
+        }
         for(const r of results){
           let rc = r.content;
           if(Array.isArray(rc)) rc = rc.map(b=>b.text||b.content||'').join('');
@@ -165,6 +288,7 @@ function anthropicToOpenAI(p){
   if(p.top_p!==undefined) out.top_p = p.top_p;
   // 上下文保护: 估算 token 超限则从头部成对截断 + 压缩超大 tool_result
   trimContext(out);
+  out.__vision = hasVision(out.messages); // 视觉标记：含图片 → callUpstreamSmart 路由到视觉上游
   return out;
 }
 
@@ -375,6 +499,12 @@ function responsesToChat( body ){
       let role = (it.role==='system'||it.role==='developer')?'system':((it.role==='assistant')?'assistant':'user');
       let content = it.content;
       if(it.type==='input_text' && it.text){ pushText(role, it.text); continue; }
+      // ---- 顶层图片（OpenAI Responses 规范 / codex 实际发送格式）：{"type":"input_image","image_url":"data:..."} ----
+      // 原实现只认 content 数组内的图片，顶层 input_image 会被静默丢弃 → 视觉请求永远到不了视觉上游
+      if((it.type==='input_image' || it.type==='image') && (it.image_url || it.image)){
+        pushImgs(role, [it.image_url || it.image]);
+        continue;
+      }
       if(Array.isArray(content)){
         const txt = content.filter(x=>x&&(x.type==='input_text'||x.type==='text')).map(x=>x.text||'').join('');
         const imgs = content.filter(x=>x&&(x.type==='input_image'||x.type==='image_url')).map(x=>x.image_url||x.image||'').filter(Boolean);
@@ -401,6 +531,7 @@ function responsesToChat( body ){
     else delete out.tool_choice;
   }
   trimContext(out);
+  out.__vision = hasVision(out.messages); // 视觉标记：含图片 → callUpstreamSmart 路由到视觉上游
   return out;
 }
 
@@ -484,7 +615,7 @@ async function handleResponses( res, authOk, bodyStr ){
       push('response.content_part.added', { item_id:iid, output_index:0, content_index:0, part:{ type:'output_text', text:'', annotations:[] } });
       let streamObj;
       try{
-        streamObj = await callUpstream(chat, true);
+        streamObj = await callUpstreamSmart(chat, true);
       }catch(eUp){
         clearHb();
         const em = (eUp&&eUp.message)||String(eUp);
@@ -598,7 +729,7 @@ async function handleResponses( res, authOk, bodyStr ){
         }
       })();
     } else {
-      const r = await callUpstream(chat, false);
+      const r = await callUpstreamSmart(chat, false);
       res.writeHead(200,{'Content-Type':'application/json'});
       res.end(JSON.stringify(chatToResponses(r, reqModel)));
     }
@@ -717,10 +848,12 @@ if(req.method==='GET' && (url==='/'||url==='/v1'||url==='/health')){ res.writeHe
       const reqModel = payload.model || 'hy3';
       if(isAnthropic){ payload = anthropicToOpenAI(payload); }
       else if(payload.model && MODEL_MAP[payload.model]){ payload.model = MODEL_MAP[payload.model]; }
+      // 原生 OpenAI chat/completions 直传请求：同样检测图片，带图走视觉上游（不带图行为完全不变）
+      if(!isAnthropic && !payload.__vision && Array.isArray(payload.messages)) payload.__vision = hasVision(payload.messages);
       const stream = !!payload.stream;
 
       if(stream){
-        const streamObj = await callUpstream(payload, true);
+        const streamObj = await callUpstreamSmart(payload, true);
         res.writeHead(200,{'Content-Type':'text/event-stream; charset=utf-8','Cache-Control':'no-cache','Connection':'keep-alive','Transfer-Encoding':'chunked','X-Accel-Buffering':'no'});
         // 保活：prefill 期间上游可能数十秒无字节，客户端/代理 idle 超时仍会掐断长 SSE 流；
         // 周期发 SSE 注释（: 开头，客户端忽略但重置 idle 计时），流收尾时清除。
@@ -746,7 +879,7 @@ if(req.method==='GET' && (url==='/'||url==='/v1'||url==='/health')){ res.writeHe
           })().catch(()=>{ clearHb(); if(!res.writableEnded) res.end(); });
         }
       } else {
-        const r = await callUpstream(payload, false);
+        const r = await callUpstreamSmart(payload, false);
         if(isAnthropic){
           res.writeHead(200,{'Content-Type':'application/json'});
           res.end(JSON.stringify(openAIToAnthropic(r, reqModel)));

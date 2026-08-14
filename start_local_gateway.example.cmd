@@ -17,6 +17,10 @@ if not defined CB_SKEY set CB_SKEY=你的_SECRET_KEY
 if not defined CB_PROXY_AUTH set CB_PROXY_AUTH=你的_PROXY_AUTH_TOKEN
 if not defined LISTEN set LISTEN=127.0.0.1
 if not defined MAX_CONCURRENCY set MAX_CONCURRENCY=4
+REM 视觉能力（可选）：填了 VISION_API_KEY 后，带图片的请求自动走智谱 GLM-4V-Flash；不填则纯 hy3
+if not defined VISION_API_KEY set VISION_API_KEY=
+if not defined VISION_BASE_URL set VISION_BASE_URL=https://open.bigmodel.cn/api/paas/v4/chat/completions
+if not defined VISION_MODEL set VISION_MODEL=glm-4v-flash
 REM node 需在 PATH 中；否则改成绝对路径，例如：
 REM "C:\Users\dongxiaotong\.workbuddy\binaries\node\versions\22.22.2\node.exe"
 node "%~dp0hermes_proxy_server_v5.js"
