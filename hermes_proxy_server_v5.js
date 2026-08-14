@@ -170,15 +170,15 @@ function injectImageFromTool(messages, toolOutput){
   const mime = (ext==='jpg'||ext==='jpeg') ? 'image/jpeg' : (ext==='gif' ? 'image/gif' : (ext==='webp' ? 'image/webp' : (ext==='bmp' ? 'image/bmp' : 'image/png')));
   const url = 'data:'+mime+';base64,'+data.toString('base64');
   messages.push({ role:'user', content:[
-    { type:'text', text:'[系统截图 '+p+'（'+data.length+' bytes），请分析截图内容，需要操作时用截图/鼠标脚本并输出新的 [IMG] 标记]' },
+    { type:'text', text:'[屏幕截图 '+p+'（'+data.length+' bytes），请分析这张图片的内容]' },
     { type:'image_url', image_url:{ url } }
   ]});
   console.log('[vision][IMG] injected '+p+' ('+data.length+' bytes) into context');
 }
 // 视觉请求时注入电脑操控工具说明（仅当头部还没有时），让视觉模型知道本机有截图/鼠标脚本可用
-const TOOLS_GUIDE = '[本机工具] 你具备电脑屏幕操控能力（Windows 本机），通过 exec 工具执行以下命令：\n' +
-  '1. 截屏: exec_command("powershell -NoProfile -ExecutionPolicy Bypass -File C:/Temp/tools/screenshot.ps1")，输出会带 [IMG]路径[/IMG] 标记，网关会自动把截图以图片形式给你。\n' +
-  '2. 鼠标: exec_command("powershell -NoProfile -ExecutionPolicy Bypass -File C:/Temp/tools/mouse.ps1 <action> <args>")，action 支持: move x y / click x y / rightclick x y / doubleclick x y / drag x1 y1 x2 y2 / scroll lines(正上负下) / type "文本" / key Enter 等。\n' +
+const TOOLS_GUIDE = '[本机工具] 你具备电脑屏幕操控能力（Windows 本机）。需要操作屏幕时，调用 exec 工具（custom 工具，输入是一段 JavaScript 源码字符串），在代码里用 await tools.exec_command(...) 执行以下命令：\n' +
+  '1. 截屏: await tools.exec_command("powershell -NoProfile -ExecutionPolicy Bypass -File C:/Temp/tools/screenshot.ps1")，脚本运行后会把截图保存到文件，网关会自动把该截图以图片形式给你。\n' +
+  '2. 鼠标: await tools.exec_command("powershell -NoProfile -ExecutionPolicy Bypass -File C:/Temp/tools/mouse.ps1 <action> <args>")，action 支持: move x y / click x y / rightclick x y / doubleclick x y / drag x1 y1 x2 y2 / scroll lines(正上负下) / type "文本" / key Enter 等。\n' +
   '3. 流程: 先截屏看图 → 根据截图坐标决定鼠标操作 → 操作后再截屏确认效果。屏幕坐标系与截图像素一致。';
 function injectToolsGuide(messages){
   if(!Array.isArray(messages) || !messages.length) return;
@@ -276,9 +276,10 @@ async function callVisionWithRetry(payload, stream){
 
 // ---------- 智能上游分发：带图片 → 视觉 API；纯文本 → CloudBase hy3 ----------
 async function callUpstreamSmart(payload, stream){
+  // 所有请求注入电脑操控工具说明（纯文本请求也让 hy3 知道本机有截图/鼠标脚本，才能发起第一步截屏）
+  if(payload && Array.isArray(payload.messages) && payload.messages.length) injectToolsGuide(payload.messages);
   if(payload && payload.__vision && VISION_API_KEY){
     payload.model = VISION_MODEL; // 视觉请求强制使用视觉模型名
-    injectToolsGuide(payload.messages); // 注入电脑操控工具说明（截图/鼠标脚本用法）
     console.log('[vision] ROUTE model='+VISION_MODEL+' stream='+!!stream+' msgs='+(payload.messages||[]).length);
     return callVisionWithRetry(payload, stream);
   }
@@ -520,16 +521,23 @@ function responsesToChat( body ){
       if(!it || typeof it !== 'object') continue;
       // ---- Responses API 内置工具：additional_tools（developer role 的 custom/function 工具，codex 用）----
       if(it.type==='additional_tools' && Array.isArray(it.tools)){
-        for(const t of it.tools){
-          if(t.type==='function' || t.function){ if(!out.tools) out.tools=[]; out.tools.push(normTool(t)); }
-          else {
-            // 把 custom 工具（如 codex 的 exec）也暴露为 function 工具，让上游能正式发起 tool_call；
-            // 网关只转发 tool_call，实际执行在客户端（codex 本地 V8）。description 必须完整传给上游——
-            // exec 的正确用法（text() 输出 / tools.exec_command() 嵌套 / 无 console 无网络）都在描述里，截断会导致模型写错代码
-            if(!out.tools) out.tools=[];
-            out.tools.push({ type:'function', function:{ name: t.name||('custom_'+((out.tools||[]).length+1)), description: t.description||'', parameters: t.input_schema||t.parameters||{ type:'object', properties:{ code:{ type:'string', description:'JavaScript source code to evaluate' } }, required:['code'] } } });
+        // codex 新版把工具包在 namespace 里（{"type":"namespace","name":"functions","tools":[exec,...]}），
+        // 必须递归展开 namespace，否则 exec 会被当成名为 "functions" 的工具暴露，模型调错名字
+        const flattenTools = (list)=>{
+          for(const t of list||[]){
+            if(t && t.type==='namespace' && Array.isArray(t.tools)){ flattenTools(t.tools); continue; }
+            if(!t) continue;
+            if(t.type==='function' || t.function){ if(!out.tools) out.tools=[]; out.tools.push(normTool(t)); }
+            else {
+              // 把 custom 工具（如 codex 的 exec）也暴露为 function 工具，让上游能正式发起 tool_call；
+              // 网关只转发 tool_call，实际执行在客户端（codex 本地 V8）。description 必须完整传给上游——
+              // exec 的正确用法（text() 输出 / tools.exec_command() 嵌套 / 无 console 无网络）都在描述里，截断会导致模型写错代码
+              if(!out.tools) out.tools=[];
+              out.tools.push({ type:'function', function:{ name: t.name||('custom_'+((out.tools||[]).length+1)), description: t.description||'', parameters: t.input_schema||t.parameters||{ type:'object', properties:{ code:{ type:'string', description:'JavaScript source code to evaluate' } }, required:['code'] } } });
+            }
           }
-        }
+        };
+        flattenTools(it.tools);
         continue;
       }
       // ---- 多轮工具结果：function_call/custom_tool_call（assistant 发起的工具调用）与 *_output（工具返回）----
@@ -626,10 +634,14 @@ async function handleResponses( res, authOk, bodyStr ){
   // custom 工具名单（由网关暴露为 function 工具）：codex 的 exec 要求参数是原始 JS 字符串而非 JSON 对象，
   // 转发 tool_call 时对 {code:...}/{string:...} 单键对象解包
   const customNames = new Set();
-  for(const it of (Array.isArray(payload&&payload.input)?payload.input:[])){
-    if(it && it.type==='additional_tools' && Array.isArray(it.tools)){
-      for(const t of it.tools){ if(t && t.type!=='function' && !t.function && t.name) customNames.add(t.name); }
+  const collectCustom = (list)=>{
+    for(const t of list||[]){
+      if(t && t.type==='namespace' && Array.isArray(t.tools)){ collectCustom(t.tools); continue; }
+      if(t && t.type!=='function' && !t.function && t.name) customNames.add(t.name);
     }
+  };
+  for(const it of (Array.isArray(payload&&payload.input)?payload.input:[])){
+    if(it && it.type==='additional_tools' && Array.isArray(it.tools)) collectCustom(it.tools);
   }
   const unwrapArgs = (name, argsStr)=>{
     if(!customNames.has(name)) return argsStr;
